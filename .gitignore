@@ -1,0 +1,13 @@
+node_modules/
+.env
+settings.json
+runs/
+memory/
+knowledge/
+demo-runs/
+demo-memory/
+demo-knowledge/
+demo-settings.json
+web/dist/
+.DS_Store
+*.log

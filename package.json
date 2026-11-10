@@ -1,0 +1,37 @@
+{
+  "name": "research-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "From-scratch purchase-decision research harness with a local web UI (learning project). Model-agnostic: any OpenAI-compatible API (Mistral by default).",
+  "scripts": {
+    "app": "npm run web:build && tsx src/server.ts",
+    "server": "tsx src/server.ts",
+    "web:dev": "vite --config web/vite.config.ts",
+    "web:build": "vite build --config web/vite.config.ts",
+    "start": "tsx src/index.ts",
+    "test": "tsx test/index.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p web",
+    "demo": "npm run web:build && tsx scripts/demo.ts",
+    "stability": "tsx scripts/stability.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@tailwindcss/typography": "^0.5.20",
+    "@tailwindcss/vite": "^4.3.5",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "tailwindcss": "^4.3.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vite": "^8.3.7"
+  }
+}
