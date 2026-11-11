@@ -76,3 +76,32 @@ test("edits are validated", () => {
   assert.match(validateBriefEdit(s, { budget: { max: -1, flexPercent: 0 } })!, /budget/);
   assert.equal(validateBriefEdit(s, { weights: { camera: 0, battery: 100 } }), null);
 });
+
+test("remarks with links queue a follow-up that must open the links, then re-score", async () => {
+  const { addUserRemark } = await import("../src/brief.ts");
+  const { gateProblems } = await import("../src/phases/research.ts");
+  const { rememberPage } = await import("../src/tools/web.ts");
+  const state = {
+    phase: "done",
+    round: 1,
+    requirements: { criteria: [], region: "India", budget: { max: 0, currency: "INR", notes: "" } },
+    candidates: [{ name: "Buds X", status: "shortlist", researched: true, followups: [], notes: [], price: "", whyConsidered: "", source: "" }],
+    evidence: [],
+    prices: [],
+  } as any;
+  assert.ok("error" in addUserRemark(state, "Nope", "x", []));
+  assert.ok("error" in addUserRemark(state, "Buds X", "", []));
+  assert.ok("error" in addUserRemark(state, "Buds X", "", ["javascript:alert(1)"]));
+  const r = addUserRemark(state, "Buds X", "Price looks wrong", ["https://shop.example/p/buds-x"]);
+  assert.deepEqual(r, { name: "Buds X", start: true });
+  assert.equal(state.phase, "research");
+  assert.equal(state.rescoreOnly, true);
+  const c = state.candidates[0];
+  assert.equal(c.followups.length, 1);
+  assert.match(gateProblems(state, c, true, 0, 0).join("; "), /open the link\(s\) the person gave/);
+  rememberPage("https://shop.example/p/buds-x", "Buds X ₹9,499");
+  // Link opened but nothing recorded yet:
+  assert.match(gateProblems(state, c, true, 0, 0).join("; "), /record what you found/);
+  state.prices.push({ id: "P1", candidate: "Buds X", amount: 9499, currency: "INR", kind: "sale", seller: "shop", url: "https://shop.example/p/buds-x", sourceType: "retailer", round: 1 });
+  assert.deepEqual(gateProblems(state, c, true, 0, 0), []);
+});

@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { Candidate, Evidence, Requirements, RunEvent, RunState } from "../../../src/shared.ts";
-import { Chip, cx, Empty, formatPrice, hostOf } from "./ui.tsx";
+import { reviewPrices } from "../../../src/pricing.ts";
+import type { Candidate, Evidence, Requirements, ReviewedPrice, RunEvent, RunState } from "../../../src/shared.ts";
+import { api } from "../api.ts";
+import { Button, Chip, cx, Empty, formatPrice, hostOf } from "./ui.tsx";
 
 /** Same ranking as src/scoring.ts: eligible first, then incomplete, then disqualified; by total within each. */
 const tier = (c: Candidate) => (!c.disqualified && !c.incomplete ? 0 : c.incomplete && !c.disqualified ? 1 : 2);
@@ -107,7 +109,9 @@ export function Brief({ req, profileUpdates }: { req?: Requirements; profileUpda
 
 const scoreColor = (s: number) => (s >= 8 ? "bg-emerald-100 text-emerald-900" : s >= 6 ? "bg-lime-50 text-lime-900" : s >= 4 ? "bg-amber-50 text-amber-900" : "bg-red-50 text-red-900");
 
-export function Candidates({ state }: { state: RunState }) {
+type EditProps = { runId: string; canEdit: boolean; onNotice: (msg: string) => void };
+
+export function Candidates({ state, runId, canEdit, onNotice }: { state: RunState } & EditProps) {
   const [open, setOpen] = useState<string | null>(null);
   const req = state.requirements;
   const scored = ranked(state.candidates);
@@ -137,14 +141,24 @@ export function Candidates({ state }: { state: RunState }) {
             </thead>
             <tbody>
               {scored.map((c, i) => (
-                <ScoreRow key={c.name} c={c} rank={i + 1} req={req} open={open === c.name} onToggle={() => setOpen(open === c.name ? null : c.name)} />
+                <ScoreRow
+                  key={c.name}
+                  c={c}
+                  rank={i + 1}
+                  req={req}
+                  prices={reviewPrices(state, c.name)}
+                  open={open === c.name}
+                  onToggle={() => setOpen(open === c.name ? null : c.name)}
+                  edit={{ runId, canEdit, onNotice }}
+                />
               ))}
             </tbody>
           </table>
           <p className="border-t border-zinc-100 px-4 py-2 text-xs text-zinc-500">
             Scores are 0-10 per criterion: measurements (lab scores, benchmarks, test hours) on a fixed scale where available, combined with a
             side-by-side comparison of the evidence. ~ medium confidence, ? low confidence. Price is the lowest current price found on a seller's
-            page; <span className="text-amber-600">?</span> means it was only seen in articles. Click a row for the measurements and reasons.
+            own product page (click it to open the page); <span className="text-amber-600">?</span> means it was only seen in articles or price
+            trackers. Click a row for the measurements, every price found, and to add your own remarks or links.
           </p>
         </div>
       )}
@@ -156,7 +170,23 @@ export function Candidates({ state }: { state: RunState }) {
   );
 }
 
-function ScoreRow({ c, rank, req, open, onToggle }: { c: Candidate; rank: number; req: Requirements; open: boolean; onToggle: () => void }) {
+function ScoreRow({
+  c,
+  rank,
+  req,
+  prices,
+  open,
+  onToggle,
+  edit,
+}: {
+  c: Candidate;
+  rank: number;
+  req: Requirements;
+  prices: ReviewedPrice[];
+  open: boolean;
+  onToggle: () => void;
+  edit: EditProps;
+}) {
   return (
     <>
       <tr onClick={onToggle} className={cx("cursor-pointer border-b border-zinc-100 hover:bg-zinc-50", (c.disqualified || c.incomplete) && "opacity-60")}>
@@ -174,10 +204,17 @@ function ScoreRow({ c, rank, req, open, onToggle }: { c: Candidate; rank: number
         <td className="px-3 py-3 text-right text-base font-semibold tabular-nums">{c.total}</td>
         <td className="whitespace-nowrap px-3 py-3 text-right tabular-nums">
           {c.bestPrice ? (
-            <span title={`${c.bestPrice.seller}${c.bestPrice.verified ? "" : " (only seen in articles)"}`}>
+            <a
+              href={c.bestPrice.url}
+              target="_blank"
+              rel="noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              className="underline decoration-zinc-300 underline-offset-2 hover:decoration-zinc-700"
+              title={`${c.bestPrice.seller}${c.bestPrice.verified ? "" : " (only seen in articles or trackers)"}: open the page`}
+            >
               {formatPrice(c.bestPrice.amount, c.bestPrice.currency)}
               {!c.bestPrice.verified && <span className="ml-1 text-amber-600">?</span>}
-            </span>
+            </a>
           ) : (
             <span className="text-zinc-400">–</span>
           )}
@@ -242,10 +279,121 @@ function ScoreRow({ c, rank, req, open, onToggle }: { c: Candidate; rank: number
                 ))}
               </ul>
             )}
+            <PriceList prices={prices} best={c.bestPrice} />
+            <Remarks c={c} edit={edit} />
           </td>
         </tr>
       )}
     </>
+  );
+}
+
+/** Every price recorded for a product, with a link to its page and whether it counted. */
+function PriceList({ prices, best }: { prices: ReviewedPrice[]; best?: Candidate["bestPrice"] }) {
+  if (!prices.length) return null;
+  const order = { used: 0, reference: 1, excluded: 2 };
+  const sorted = [...prices].sort((a, b) => order[a.use] - order[b.use] || a.amount - b.amount);
+  return (
+    <div className="mt-4">
+      <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Prices found</div>
+      <ul className="mt-1 space-y-1 text-sm">
+        {sorted.map((p) => (
+          <li key={p.id} className={cx("flex flex-wrap items-baseline gap-x-2", p.use === "excluded" && "text-zinc-400")}>
+            <span className={cx("tabular-nums", p.use === "excluded" && "line-through")}>{formatPrice(p.amount, p.currency)}</span>
+            <a href={p.url} target="_blank" rel="noreferrer" className="text-sky-700 hover:underline" onClick={(e) => e.stopPropagation()}>
+              {p.seller} ({hostOf(p.url)}) ↗
+            </a>
+            {best && p.url === best.url && p.amount === best.amount ? (
+              <Chip tone={best.verified ? "green" : "amber"}>{best.verified ? "used for budget" : "shown, unconfirmed"}</Chip>
+            ) : (
+              p.use === "used" && <span className="text-xs text-zinc-500">seller page</span>
+            )}
+            {p.reason && <span className="text-xs text-zinc-500">{p.use === "excluded" ? "not used: " : ""}{p.reason}</span>}
+            {p.quote && (
+              <span className="w-full truncate text-xs text-zinc-400" title={p.quote}>
+                "{p.quote}"
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** The person's remarks and links on a product; adding one triggers a follow-up research pass. */
+function Remarks({ c, edit }: { c: Candidate; edit: EditProps }) {
+  const [text, setText] = useState("");
+  const [links, setLinks] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const remarks = c.userRemarks ?? [];
+
+  async function submit() {
+    setBusy(true);
+    setError(null);
+    try {
+      const list = links.split(/[\s,]+/).filter(Boolean);
+      const r = await api.addRemark(edit.runId, c.name, text, list);
+      setText("");
+      setLinks("");
+      edit.onNotice(
+        r.started
+          ? `Checking your remark on ${r.name} now${list.length ? " (opening your links)" : ""}. Then everything is re-scored and the recommendation updated.`
+          : `Remark added to ${r.name}. It's researched when you resume.`,
+      );
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-4" onClick={(e) => e.stopPropagation()}>
+      <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Your remarks</div>
+      {remarks.length > 0 && (
+        <ul className="mt-1 space-y-1 text-sm">
+          {remarks.map((r, i) => (
+            <li key={i} className="text-zinc-700">
+              {r.text || <span className="text-zinc-400">(links only)</span>}{" "}
+              {r.links.map((l) => (
+                <a key={l} href={l} target="_blank" rel="noreferrer" className="mr-2 text-sky-700 hover:underline">
+                  {hostOf(l)} ↗
+                </a>
+              ))}
+              <span className="text-xs text-zinc-400">{r.done ? "checked" : "waiting to be researched"}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {edit.canEdit ? (
+        <div className="mt-2 space-y-2">
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            rows={2}
+            placeholder={'e.g. "The price looks wrong, it\'s ₹9,000+ on Amazon" or "Check the refurbished version"'}
+            className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm outline-none focus:border-zinc-500"
+          />
+          <input
+            value={links}
+            onChange={(e) => setLinks(e.target.value)}
+            placeholder="Links to check (optional, separate with spaces): product page, review, Reddit thread..."
+            className="w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 font-mono text-xs outline-none focus:border-zinc-500"
+          />
+          <div className="flex items-center gap-3">
+            <Button onClick={submit} disabled={busy || (!text.trim() && !links.trim())}>
+              {busy ? "Sending..." : "Research this"}
+            </Button>
+            <span className="text-xs text-zinc-500">The researcher opens your links and checks your remark, then everything is re-scored. Remarks are leads: sources decide.</span>
+          </div>
+          {error && <p className="text-sm text-red-600">{error}</p>}
+        </div>
+      ) : (
+        !remarks.length && <p className="mt-1 text-xs text-zinc-500">You can add remarks or links when the research isn't running.</p>
+      )}
+    </div>
   );
 }
 

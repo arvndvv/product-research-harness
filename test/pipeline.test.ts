@@ -99,9 +99,10 @@ function fakeModel(req: ChatRequest): AssistantMessage {
   if (system.includes("compare products on ONE criterion")) {
     // All products are compared together in one call.
     const user = req.messages[1].content as string;
-    const names = [...user.matchAll(/^### (.+)$/gm)].map((m) => m[1]);
+    const items = [...user.matchAll(/^### (P\d+): (.+)$/gm)].map((m) => ({ id: m[1], name: m[2] }));
     const base: Record<string, number> = { "Shoe A": 9.5, "Shoe B": 7, "Shoe C": 9.8, "Shoe Z": 9 };
-    return json({ scores: names.map((n) => ({ product: n, score: base[n] ?? 5, rationale: "compared E1" })) });
+    // Names deliberately "corrected" by the model: matching must go by id.
+    return json({ scores: items.map((p) => ({ id: p.id, product: `${p.name} (edited)`, score: base[p.name] ?? 5, rationale: "compared E1" })) });
   }
   if (system.includes("skeptical senior reviewer")) {
     critiques++;

@@ -112,6 +112,37 @@ export function planAfterEdit(state: RunState, needsRescore: boolean): "report" 
  * side-by-side comparison); on a finished run, only research, scoring and the
  * report run again.
  */
+/**
+ * The person's remark on a product, optionally with links ("this Amazon page has
+ * it for ₹9,499", "check the refurbished one"). The product gets a follow-up
+ * research pass that must open those links; then everything is re-scored.
+ */
+export function addUserRemark(state: RunState, name: string, rawText: string, rawLinks: string[]): { name: string; start: boolean } | { error: string } {
+  const c = state.candidates.find((x) => x.name === name);
+  if (!c || c.status !== "shortlist") return { error: "that product isn't in the comparison" };
+  const text = rawText.trim().replace(/\s+/g, " ").slice(0, 600);
+  const links = [...new Set(rawLinks.map((l) => l.trim()).filter(Boolean))];
+  if (links.length > 5) return { error: "add at most 5 links at a time" };
+  for (const l of links) {
+    try {
+      if (!/^https?:$/.test(new URL(l).protocol)) throw new Error();
+    } catch {
+      return { error: `not a web link: ${l}` };
+    }
+  }
+  if (!text && !links.length) return { error: "write a remark or add a link" };
+  (c.userRemarks ??= []).push({ text, links, t: new Date().toISOString() });
+  // Researched products get a follow-up pass; unresearched ones see the remark in their first pass.
+  if (c.researched) c.followups = [...c.followups, "Check the person's remarks below."];
+  c.dirty = true;
+  if (state.phase === "done") {
+    state.phase = "research";
+    state.rescoreOnly = true;
+    return { name: c.name, start: true };
+  }
+  return { name: c.name, start: false };
+}
+
 export function addUserCandidate(state: RunState, rawName: string, note: string): { name: string; start: boolean } | { error: string } {
   const name = rawName.trim().replace(/\s+/g, " ");
   if (name.length < 2 || name.length > 120) return { error: "give the product's full name, e.g. 'Samsung Galaxy S24 FE'" };

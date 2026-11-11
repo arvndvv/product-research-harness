@@ -195,7 +195,7 @@ export async function intakePhase(state: RunState) {
         { role: "system", content: systemPrompt(max) },
         { role: "user", content: turnMessage(state, qa, remaining) },
       ],
-      { validate: (t) => checkTurn(t, qa, remaining), temperature: 0.2 },
+      { validate: (t) => checkTurn(t, qa, remaining), temperature: 0.2, label: "Interview" },
     );
 
     const q = turn.next_question;

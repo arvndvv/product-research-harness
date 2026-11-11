@@ -30,3 +30,27 @@ test("only a verified price can rule a product out", () => {
   assert.equal(budgetVerdict(req, articleOver), "unverified");
   assert.equal(budgetVerdict(req, undefined), "unknown");
 });
+
+test("the Buds case: search-page knock-offs and trackers don't become the price", async () => {
+  const { reviewPrices, isListingPage } = await import("../src/pricing.ts");
+  assert.ok(isListingPage("https://www.amazon.in/samsung-buds-2-pro/s?k=samsung+buds+2+pro&page=2"));
+  assert.ok(isListingPage("https://www.flipkart.com/search?q=buds"));
+  assert.ok(!isListingPage("https://www.flipkart.com/samsung-galaxy-buds2-pro-sm-r510nzaainu-bluetooth-headset/p/itm3d988d0944240"));
+  const s = stateWith([
+    p({ id: "P1", amount: 1899, url: "https://www.amazon.in/samsung-buds-2-pro/s?k=samsung+buds+2+pro", seller: "Amazon (listing)" }),
+    p({ id: "P2", amount: 14999, url: "https://pricehistory.app/p/samsung-galaxy-buds2-pro", seller: "amazon.in" }),
+    p({ id: "P3", amount: 12350, url: "https://www.flipkart.com/samsung-galaxy-buds2-pro/p/itm3d9", seller: "Flipkart" }),
+  ]);
+  assert.deepEqual(bestPrice(s, "Phone"), { amount: 12350, currency: "INR", seller: "Flipkart", url: "https://www.flipkart.com/samsung-galaxy-buds2-pro/p/itm3d9", verified: true });
+  const r = Object.fromEntries(reviewPrices(s, "Phone").map((x) => [x.id, x.use]));
+  assert.deepEqual(r, { P1: "excluded", P2: "reference", P3: "used" });
+});
+
+test("a seller price far below the others is treated as a different item", async () => {
+  const s = stateWith([
+    p({ id: "P1", amount: 2199, url: "https://shop-a.example/p/1" }),
+    p({ id: "P2", amount: 11999, url: "https://shop-b.example/p/2" }),
+    p({ id: "P3", amount: 12499, url: "https://shop-c.example/p/3" }),
+  ]);
+  assert.equal(bestPrice(s, "Phone")?.amount, 11999);
+});

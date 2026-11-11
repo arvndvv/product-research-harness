@@ -150,9 +150,10 @@ export function extractJson(text: string): string {
  */
 export async function chatJSON<T>(
   messages: ChatMessage[],
-  opts: { validate?: (value: any) => string | null; temperature?: number; profile?: ModelProfile } = {},
+  opts: { validate?: (value: any) => string | null; temperature?: number; profile?: ModelProfile; label?: string } = {},
 ): Promise<T> {
   const history = [...messages];
+  let lastProblem = "";
   for (let attempt = 1; attempt <= 3; attempt++) {
     const reply = await chat({ messages: history, json: true, temperature: opts.temperature ?? 0, profile: opts.profile });
     const text = reply.content ?? "";
@@ -165,10 +166,13 @@ export async function chatJSON<T>(
       problem = `invalid JSON (${(e as Error).message})`;
     }
     if (!problem) return parsed as T;
+    lastProblem = problem;
+    log(`${opts.label ?? "model reply"}: ${problem}${attempt < 3 ? ", asking the model to fix it" : ""}`, "warn");
     history.push(
       { role: "assistant", content: text },
       { role: "user", content: `That JSON has a problem: ${problem}. Reply again with the corrected JSON object only.` },
     );
   }
-  throw new Error("Model failed to produce valid JSON after 3 attempts");
+  // Say what was wrong: "invalid JSON" and "valid JSON with a missing field" need different fixes.
+  throw new Error(`${opts.label ?? "The model"} gave an unusable answer 3 times. Last problem: ${lastProblem}`);
 }

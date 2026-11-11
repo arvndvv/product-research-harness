@@ -154,7 +154,7 @@ function fakeModel(req: ChatRequest): AssistantMessage {
 
   if (system.includes("compare products on ONE criterion")) {
     const user = req.messages[1].content as string;
-    const names = [...user.matchAll(/^### (.+)$/gm)].map((m) => m[1]);
+    const names = [...user.matchAll(/^### P\d+: (.+)$/gm)].map((m) => m[1]);
     const crit = system.match(/Criterion: ([^.]+)\./)?.[1] ?? "";
     const base: Record<string, number> = { "Trailblazer Grip 3": 8, "CityStride Comfort": 7, "Courtline All-Rounder": 6, "AeroWalk Mesh 2": 5 };
     return json({

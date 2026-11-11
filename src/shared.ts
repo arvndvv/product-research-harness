@@ -71,6 +71,11 @@ export type MetricObservation = {
 };
 
 /** A price seen for a product. Prices are data, so budget checks run in code. */
+export type UserRemark = { text: string; links: string[]; t: string; done?: boolean };
+
+/** A recorded price, with code's verdict on whether it counts. */
+export type ReviewedPrice = PriceObservation & { use: "used" | "excluded" | "reference"; reason?: string };
+
 export type PriceObservation = {
   id: string;
   candidate: string;
@@ -126,6 +131,8 @@ export type Candidate = {
   dirty: boolean;
   /** Suggested by the person rather than found by discovery. */
   addedByUser?: boolean;
+  /** Remarks and links the person added to this product; open ones are researched next. */
+  userRemarks?: UserRemark[];
   /** Already got an extra research pass for being thinly researched. */
   toppedUp?: boolean;
 };

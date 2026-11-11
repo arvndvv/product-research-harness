@@ -150,6 +150,7 @@ For an existing key, just repeat the key; other fields are ignored.`,
     ],
     {
       profile: "judge",
+      label: "Planning measurements",
       validate: (v) => {
         if (!Array.isArray(v?.criteria)) return 'missing "criteria" array';
         for (const c of req.criteria) {

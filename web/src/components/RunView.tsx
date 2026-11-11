@@ -191,7 +191,10 @@ export default function RunView({ id, onChange }: { id: string; onChange: () => 
                 <div className="mt-1 text-sm tabular-nums text-zinc-300">{c.total}/100</div>
                 {c.bestPrice && (
                   <div className="mt-1 text-sm text-zinc-300">
-                    {formatPrice(c.bestPrice.amount, c.bestPrice.currency)} at {c.bestPrice.seller}
+                    {formatPrice(c.bestPrice.amount, c.bestPrice.currency)} at{" "}
+                    <a href={c.bestPrice.url} target="_blank" rel="noreferrer" className="underline decoration-zinc-500 underline-offset-2 hover:text-white">
+                      {c.bestPrice.seller} ↗
+                    </a>
                     {!c.bestPrice.verified && <span className="text-amber-300"> · check price</span>}
                   </div>
                 )}
@@ -214,7 +217,10 @@ export default function RunView({ id, onChange }: { id: string; onChange: () => 
           </div>
           {top[0].bestPrice && (
             <div className="mt-1 text-sm text-zinc-300">
-              {formatPrice(top[0].bestPrice.amount, top[0].bestPrice.currency)} at {top[0].bestPrice.seller}
+              {formatPrice(top[0].bestPrice.amount, top[0].bestPrice.currency)} at{" "}
+              <a href={top[0].bestPrice.url} target="_blank" rel="noreferrer" className="underline decoration-zinc-500 underline-offset-2 hover:text-white">
+                {top[0].bestPrice.seller} ↗
+              </a>
               {!top[0].bestPrice.verified && <span className="text-amber-300"> · price not confirmed on a seller page, check before buying</span>}
             </div>
           )}
@@ -315,7 +321,15 @@ export default function RunView({ id, onChange }: { id: string; onChange: () => 
                 }}
               />
             )}
-            <Candidates state={state} />
+            <Candidates
+              state={state}
+              runId={id}
+              canEdit={canAdjust}
+              onNotice={(msg) => {
+                setNotice(msg);
+                refresh();
+              }}
+            />
           </>
         )}
         {activeTab === "evidence" && <EvidenceList evidence={state.evidence} candidates={state.candidates} />}

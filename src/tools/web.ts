@@ -173,7 +173,13 @@ export function verifyQuote(url: string, quote: string, opts: { allowSnippet?: b
   return "not-found";
 }
 
+// URLs the agent tried to open, whether or not the site allowed it.
+const attempted = new Set<string>();
+/** Has this URL been opened (or at least tried)? Used to make sure links the person gave were looked at. */
+export const wasAttempted = (url: string) => attempted.has(urlKey(url)) || pageCache.has(urlKey(url));
+
 async function fetchPage(url: string): Promise<string> {
+  attempted.add(urlKey(url));
   const cached = pageCache.get(urlKey(url));
   if (cached) return cached;
 

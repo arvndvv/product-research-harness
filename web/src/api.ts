@@ -21,6 +21,8 @@ export const api = {
   startRun: (text: string) => request<RunSummary>("/api/runs", { method: "POST", body: JSON.stringify({ request: text }) }),
   addCandidate: (id: string, name: string, note: string) =>
     request<{ name: string; started: boolean }>(`/api/runs/${encodeURIComponent(id)}/candidates`, { method: "POST", body: JSON.stringify({ name, note }) }),
+  addRemark: (id: string, name: string, text: string, links: string[]) =>
+    request<{ name: string; started: boolean }>(`/api/runs/${encodeURIComponent(id)}/remarks`, { method: "POST", body: JSON.stringify({ name, text, links }) }),
   stop: (id: string) => request<{ ok: true }>(`/api/runs/${encodeURIComponent(id)}/stop`, { method: "POST" }),
   editBrief: (id: string, edit: BriefEdit) =>
     request<{ changes: string[]; next: "report" | "score" | "none" }>(`/api/runs/${encodeURIComponent(id)}/brief`, { method: "PUT", body: JSON.stringify(edit) }),

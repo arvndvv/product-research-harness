@@ -62,3 +62,14 @@ test("a product you add is researched and compared, then only the report is redo
   assert.equal(state.candidates[1].status, "shortlist");
   assert.match((addUserCandidate(state, "alpha", "") as { error: string }).error, /already being compared/);
 });
+
+test("judge scores match product names loosely but never ambiguously", async () => {
+  const { findScore } = await import("../src/phases/score.ts");
+  const scores = [{ product: "Samsung Galaxy S25 FE 5G", score: 7 }, { product: "iQOO 12", score: 6 }];
+  assert.equal(findScore(scores, "Samsung Galaxy S25 FE 5G")?.score, 7);
+  assert.equal(findScore(scores, "samsung galaxy s25 fe (5g)")?.score, 7);
+  assert.equal(findScore(scores, "Galaxy S25 FE")?.score, 7);
+  assert.equal(findScore(scores, "IQOO-12")?.score, 6);
+  // "Galaxy S25" would match both "S25" and "S25 FE": refuse rather than guess.
+  assert.equal(findScore([{ product: "Samsung Galaxy S25" }, { product: "Samsung Galaxy S25 FE" }], "Galaxy S25"), undefined);
+});

@@ -138,7 +138,7 @@ JSON: {"must_haves":[{"item":"...","met":"yes|no|unknown","evidence_ids":[]}],"d
       },
       { role: "user", content: `Product: ${c.name}\n\nEvidence:\n${evidenceBlock(ev)}` },
     ],
-    { profile: "judge", validate: (v) => (Array.isArray(v?.must_haves) ? null : 'missing "must_haves" array') },
+    { profile: "judge", label: `Checking must-haves for ${c.name}`, validate: (v) => (Array.isArray(v?.must_haves) ? null : 'missing "must_haves" array') },
   );
   const failedMust = (result.must_haves ?? []).filter((m) => m.met === "no" && m.evidence_ids?.some((id) => validIds.has(id)));
   const hitDeal = (result.dealbreakers_hit ?? []).filter((d) => d.evidence_ids?.some((id) => validIds.has(id)));
@@ -184,11 +184,19 @@ async function compareOnCriterion(state: RunState, products: Candidate[], criter
 async function compareOnce(state: RunState, products: Candidate[], criterion: string) {
   const req = state.requirements!;
   const cr = req.criteria.find((c) => c.name === criterion)!;
-  const blocks = products.map((c) => {
+  // Products are referred to by id (P1, P2...), not by name. Models "correct" names,
+  // e.g. a user-typed "sumsung buds 2 pro" comes back as "samsung buds 2 pro",
+  // and a name mismatch used to stop the run.
+  const ids = new Map(products.map((c, i) => [`P${i + 1}`, c.name]));
+  const pick = (scores: any[], c: Candidate) => {
+    const id = [...ids].find(([, name]) => name === c.name)![0];
+    return scores.find((x) => String(x?.id ?? "").trim().toUpperCase() === id) ?? findScore(scores, c.name);
+  };
+  const blocks = products.map((c, i) => {
     const m = metricScoreFor(state, c.name, criterion);
     const measured = m.measured.length ? m.measured.map((x) => `${x.label}: ${x.value} ${x.unit}${x.confirmed ? "" : " (single source)"}`).join("; ") : "none found";
     const ev = evidenceFor(state, c.name).filter((e) => e.criterion === criterion);
-    return `### ${c.name}\nMeasurements: ${measured}\nFindings:\n${evidenceBlock(ev)}`;
+    return `### P${i + 1}: ${c.name}\nMeasurements: ${measured}\nFindings:\n${evidenceBlock(ev)}`;
   });
 
   const result = await chatJSON<CompareJSON>(
@@ -209,27 +217,40 @@ How to score (0-10, half points allowed):
 - Use only the findings and measurements given. With little evidence, stay near 5.
 - Rationale: one sentence, citing evidence ids like E12.
 
-JSON: {"scores":[{"product":"<exact name>","score":0,"rationale":"..."}]}`,
+JSON, one entry per product, using its id from the heading: {"scores":[{"id":"P1","product":"<name>","score":0,"rationale":"..."}]}`,
       },
       { role: "user", content: blocks.join("\n\n") },
     ],
     {
       profile: "judge",
+      label: `Comparing on ${criterion}`,
       validate: (v) => {
         if (!Array.isArray(v?.scores)) return 'missing "scores" array';
         for (const c of products) {
-          const s = v.scores.find((x: any) => x?.product === c.name);
-          if (!s) return `missing score for "${c.name}" (use the exact name)`;
-          if (typeof s.score !== "number" || s.score < 0 || s.score > 10) return `score for "${c.name}" must be a number 0-10`;
+          const s = pick(v.scores, c);
+          if (!s) return `missing score for ${[...ids].find(([, n]) => n === c.name)![0]} (${c.name}); include its "id"`;
+          if (!Number.isFinite(Number(s.score)) || Number(s.score) < 0 || Number(s.score) > 10) return `score for "${c.name}" must be a number 0-10`;
         }
         return null;
       },
     },
   );
   return new Map(products.map((c) => {
-    const s = result.scores.find((x) => x.product === c.name)!;
-    return [c.name, { score: round1(s.score), rationale: String(s.rationale ?? "") }];
+    const s = pick(result.scores, c);
+    return [c.name, { score: round1(Number(s.score)), rationale: String(s.rationale ?? "") }];
   }));
+}
+
+/** Models often tweak names slightly ("Galaxy S25 FE" vs "Samsung Galaxy S25 FE 5G"): match exact first, then loosely. */
+const nameKey = (s: unknown) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+export function findScore<T extends { product?: unknown }>(scores: T[], name: string): T | undefined {
+  const key = nameKey(name);
+  return (
+    scores.find((x) => x?.product === name) ??
+    scores.find((x) => nameKey(x?.product) === key) ??
+    // Only accept a containment match when it's unambiguous.
+    ((m) => (m.length === 1 ? m[0] : undefined))(scores.filter((x) => { const k = nameKey(x?.product); return k.length > 3 && (k.includes(key) || key.includes(k)); }))
+  );
 }
 
 /**

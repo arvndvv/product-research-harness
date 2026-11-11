@@ -29,9 +29,9 @@ import { domainBlock } from "../knowledge.ts";
 import { ageDays, loadProduct, saveProduct } from "../library.ts";
 import { finishTool, runAgent, tool } from "../loop.ts";
 import { measuredValue, metricStatus, planMetrics } from "../metrics.ts";
-import { budgetLimit, formatMoney, pricesFor } from "../pricing.ts";
+import { budgetLimit, formatMoney, isListingPage, pricesFor, reviewPrices } from "../pricing.ts";
 import { evidenceFor, matchCriterion, saveState, type Candidate, type RunState, type SourceType } from "../state.ts";
-import { makeWebTools, verifyQuote } from "../tools/web.ts";
+import { makeWebTools, verifyQuote, wasAttempted } from "../tools/web.ts";
 import { domainOf } from "../util/html.ts";
 
 const SOURCE_TYPES: SourceType[] = ["expert_review", "community", "spec", "retailer", "other"];
@@ -92,8 +92,12 @@ async function balanceResearch(state: RunState) {
   }
 }
 
+/** Remarks the person added that haven't been researched yet. */
+const openRemarks = (c: Candidate) => (c.userRemarks ?? []).filter((r) => !r.done);
+
 function finishCandidate(state: RunState, c: Candidate, ok: boolean) {
   if (ok) c.incomplete = undefined;
+  for (const r of c.userRemarks ?? []) r.done = true;
   c.researched = true;
   c.followups = [];
   c.dirty = true;
@@ -166,7 +170,7 @@ function coverage(state: RunState, c: Candidate) {
   const sites = new Set(ev.map((e) => domainOf(e.sourceUrl)).filter(Boolean));
   const community = ev.filter((e) => e.sourceType === "community").length;
   const prices = pricesFor(state, c.name);
-  const sellerPrices = prices.filter((p) => p.sourceType !== "article").length;
+  const sellerPrices = reviewPrices(state, c.name).filter((p) => p.use === "used").length;
   const planned = [...new Set((state.metricPlan ?? []).flatMap((p) => p.keys))];
   const statuses = planned.map((k) => ({ key: k, ...metricStatus(state, c.name, k) }));
   const measured = statuses.filter((s) => s.value !== undefined).map((s) => s.key);
@@ -181,13 +185,19 @@ function coverage(state: RunState, c: Candidate) {
 }
 
 /** What's still missing before research on this product may finish. Empty = done. */
-export function gateProblems(state: RunState, c: Candidate, isFollowup: boolean, evidenceBefore: number): string[] {
+export function gateProblems(state: RunState, c: Candidate, isFollowup: boolean, evidenceBefore: number, pricesBefore = 0): string[] {
   const req = state.requirements!;
   const { minEvidence, minDistinctSites } = config.limits;
   const cov = coverage(state, c);
   const problems: string[] = [];
+  // Links the person gave must at least be opened (some sites block it; trying counts).
+  const unopened = openRemarks(c).flatMap((r) => r.links).filter((l) => !wasAttempted(l));
+  if (unopened.length) problems.push(`open the link(s) the person gave with fetch_page: ${unopened.join(", ")}`);
   if (isFollowup) {
-    if (cov.ev.length - evidenceBefore < 2) problems.push("record at least 2 new findings that answer the follow-up questions");
+    if (openRemarks(c).length) {
+      // A remark may be about price only, so a new price counts as an answer too.
+      if (cov.ev.length - evidenceBefore < 1 && cov.prices.length - pricesBefore < 1) problems.push("record what you found about the person's remark: a finding (record_evidence) or a price (record_price)");
+    } else if (cov.ev.length - evidenceBefore < 2) problems.push("record at least 2 new findings that answer the follow-up questions");
     return problems;
   }
   if (cov.ev.length < minEvidence) problems.push(`only ${cov.ev.length} findings, need ${minEvidence}`);
@@ -221,6 +231,7 @@ async function researchCandidate(state: RunState, c: Candidate, isRetry: boolean
   const req = state.requirements!;
   const isFollowup = c.researched;
   const before = evidenceFor(state, c.name).length;
+  const pricesBefore = pricesFor(state, c.name).length;
   const currency = req.budget.currency || "local currency";
   const defs = state.metricDefs ?? {};
   let rejections = 0;
@@ -318,6 +329,8 @@ async function researchCandidate(state: RunState, c: Candidate, isRetry: boolean
       const value = Number(String(amount).replace(/[^0-9.]/g, ""));
       if (!value || value <= 0) return "ERROR: amount must be a positive number.";
       if (!/^https?:\/\//.test(String(url))) return "ERROR: url must be the page where you saw the price.";
+      if (isListingPage(String(url)))
+        return "ERROR: that's a search or listing page, which mixes in accessories, copies and other models. Open the product's own page and record the price from there.";
       const err = checkNumberQuote(String(url), String(quote ?? ""), value);
       if (err) return err;
       state.prices ??= [];
@@ -348,7 +361,7 @@ async function researchCandidate(state: RunState, c: Candidate, isRetry: boolean
       insufficient_reason: { type: "string", description: "Only if asked: why some coverage genuinely can't be found" },
     },
     ({ summary, insufficient_reason }) => {
-      const problems = gateProblems(state, c, isFollowup, before);
+      const problems = gateProblems(state, c, isFollowup, before, pricesBefore);
       if (!problems.length) {
         if (summary) c.notes.push(`Round ${state.round}: ${summary}`);
         return null;
@@ -371,11 +384,17 @@ async function researchCandidate(state: RunState, c: Candidate, isRetry: boolean
   const budgetLine = limit === Infinity ? "" : `\nBudget limit: ${formatMoney(limit, currency)}. A verified seller price above that rules the product out, so get the CURRENT price right.`;
   const retryNote = isRetry ? `\nA previous attempt ran out of steps. Be efficient: fewer searches, open the most promising pages, and record findings as you go.\n` : "";
   const known = existing.length ? `\n\nAlready recorded (don't repeat; focus on what's missing):\n${evidenceBlock(existing)}\n${coverage(state, c).summary}` : "";
+  const remarks = openRemarks(c);
+  const remarkBlock = remarks.length
+    ? `\n\nThe person added remarks about this product. Address each one, and open every link they gave with fetch_page (record what it shows: findings with record_evidence, prices with record_price):\n${remarks
+        .map((r) => `- "${r.text || "(no comment)"}"${r.links.length ? `\n  Links: ${r.links.join(" ")}` : ""}`)
+        .join("\n")}\nTheir remarks are leads, not facts: record what the sources actually say, even if it disagrees.`
+    : "";
   const task = isFollowup
-    ? `Follow-up research on "${c.name}". Answer these open questions with new evidence:\n${c.followups.map((q) => `- ${q}`).join("\n")}\n\nEvidence already recorded (don't repeat it):\n${evidenceBlock(existing)}${retryNote}`
+    ? `Follow-up research on "${c.name}". Answer these open questions with new evidence:\n${c.followups.map((q) => `- ${q}`).join("\n")}${remarkBlock}\n\nEvidence already recorded (don't repeat it):\n${evidenceBlock(existing)}${retryNote}`
     : `Research "${c.name}" for this person. It was considered because: ${c.whyConsidered}${budgetLine}${known}${
         coverage(state, c).carried ? `\n\nSome findings above come from earlier research (marked with a date). Check they still hold for the current version, and record anything that contradicts them as a new finding that says so.` : ""
-      }${retryNote}`;
+      }${remarkBlock}${retryNote}`;
 
   const metricList = Object.values(defs);
   const metricsText = metricList.length
@@ -396,7 +415,7 @@ How to research:
 - Open pages with fetch_page; search snippets are not evidence.
 - Record each concrete finding with record_evidence: specific facts (numbers, conditions, who said it), not vague praise. Record negatives as carefully as positives.
 - Every finding, measurement and price needs a VERBATIM quote from its source; code checks it against the page. Only record what the page actually says.
-- Prices: check the CURRENT price at the official store and big retailers in ${req.region} (search e.g. "<product> price ${req.region}" and open seller pages). Record every price with record_price. Prices in articles and launch coverage are often months old; record them as "article", never as the current price.${metricsText}
+- Prices: check the CURRENT price at the official store and big retailers in ${req.region} (search e.g. "<product> price ${req.region}" and open seller pages). Record prices from the product's own page, never from search results or listings (they mix in accessories and copies "for" this product). Record every price with record_price. Prices in articles and launch coverage are often months old; record them as "article", never as the current price.${metricsText}
 - When coverage is good, call finish_research.`;
 
   const result = await runAgent({

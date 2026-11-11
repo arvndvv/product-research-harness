@@ -126,6 +126,7 @@ JSON format: {"shortlist":[{"name":"...","reason":"..."}],"cut":[{"name":"...","
     ],
     {
       profile: "judge",
+      label: "Shortlisting",
       validate: (v) => {
         if (!Array.isArray(v?.shortlist) || !v.shortlist.length) return "shortlist must be a non-empty array";
         if (v.shortlist.length > max) return `shortlist has ${v.shortlist.length} items, max is ${max}`;

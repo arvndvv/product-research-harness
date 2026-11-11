@@ -78,7 +78,7 @@ JSON format:
       role: "user",
       content: `Round ${state.round + 1} of max ${maxRounds}.\n\nScoreboard:\n${board || "(nothing scored)"}\n\nAlready cut: ${cut.join("; ") || "(none)"}`,
     },
-  ], { profile: "judge" });
+  ], { profile: "judge", label: "Reviewing the decision" });
 
   state.critiqueNotes.push(`Round ${state.round}: ${result.verdict} - ${result.notes}`);
   log(`Critic: ${result.verdict}. ${result.notes}`, result.verdict === "done" ? "ok" : "info");

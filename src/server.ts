@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, join, resolve } from "node:path";
-import { addUserCandidate, applyBriefEdit, planAfterEdit, validateBriefEdit } from "./brief.ts";
+import { addUserCandidate, addUserRemark, applyBriefEdit, planAfterEdit, validateBriefEdit } from "./brief.ts";
 import { applyUpdate, llmTarget, missingSettings, PROVIDER_PRESETS, SEARCH_OPTIONS, searchSettings, settingsView, validateUpdate, loadSettings } from "./settings.ts";
 import { deleteGuide, draftGuide, guideName, listGuides, listModels, readGuide, testConnection, writeGuide } from "./admin.ts";
 import { config } from "./config.ts";
@@ -288,6 +288,20 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       if ("error" in result) return sendJson(res, 400, { error: result.error });
       saveState(state);
       publish(id, { type: "log", level: "info", text: `You added ${result.name} to the comparison${note ? ` (${note})` : ""}` });
+      if (result.start) startRun(state);
+      else publish(id, { type: "state" });
+      return sendJson(res, 200, { name: result.name, started: result.start });
+    }
+
+    if (action === "/remarks" && method === "POST") {
+      const a = active.get(id);
+      if (a && (a.status === "running" || a.status === "waiting")) return sendJson(res, 409, { error: "wait for the research to finish, or stop it, before adding a remark" });
+      const { name, text, links } = await readJson(req);
+      const state = loadState(runDir(id));
+      const result = addUserRemark(state, String(name ?? ""), String(text ?? ""), Array.isArray(links) ? links.map(String) : []);
+      if ("error" in result) return sendJson(res, 400, { error: result.error });
+      saveState(state);
+      publish(id, { type: "log", level: "info", text: `Your remark on ${result.name}: ${String(text ?? "").trim() || "(links only)"}${Array.isArray(links) && links.length ? ` [${links.length} link(s)]` : ""}` });
       if (result.start) startRun(state);
       else publish(id, { type: "state" });
       return sendJson(res, 200, { name: result.name, started: result.start });
