@@ -47,6 +47,33 @@ export function tool(
   };
 }
 
+/**
+ * A tool that records several items in one call (findings, prices). Each model
+ * call resends the whole conversation, so batching is a direct cost saving.
+ * Accepts {[listKey]: [...items]} or, for compatibility, a single item's fields.
+ */
+export function batchTool(
+  name: string,
+  description: string,
+  listKey: string,
+  itemProperties: Record<string, unknown>,
+  recordOne: (item: any) => string,
+  after: () => string = () => "",
+): Tool {
+  return tool(
+    name,
+    `${description} Record several at once when you have them: one call with a list is cheaper than many calls.`,
+    { [listKey]: { type: "array", items: { type: "object", properties: itemProperties, required: Object.keys(itemProperties) } } },
+    (args) => {
+      const items: any[] = Array.isArray(args?.[listKey]) ? args[listKey] : [args];
+      if (!items.length) return `ERROR: ${listKey} is empty.`;
+      const results = items.map((it, i) => (items.length > 1 ? `${i + 1}. ` : "") + recordOne(it ?? {}));
+      const tail = after();
+      return `${results.join("\n")}${tail ? `\n${tail}` : ""}`;
+    },
+  );
+}
+
 export function finishTool(
   name: string,
   description: string,
@@ -72,7 +99,7 @@ function describeArgs(args: any): string {
 const TRIM_NOTE = "\n[...older tool output trimmed to save context; key facts should already be recorded]";
 
 /** Trim long tool outputs except the most recent ones. */
-export function compactHistory(messages: ChatMessage[], keepRecent = 10, maxOldChars = 500) {
+export function compactHistory(messages: ChatMessage[], keepRecent = 4, maxOldChars = 300) {
   for (let i = 0; i < messages.length - keepRecent; i++) {
     const m = messages[i];
     if (m.role === "tool" && m.content.length > maxOldChars && !m.content.endsWith(TRIM_NOTE)) {

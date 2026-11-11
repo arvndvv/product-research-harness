@@ -27,8 +27,8 @@ import { log, throwIfStopped } from "../context.ts";
 import { evidenceBlock, requirementsBlock } from "../format.ts";
 import { domainBlock } from "../knowledge.ts";
 import { ageDays, loadProduct, saveProduct } from "../library.ts";
-import { finishTool, runAgent, tool } from "../loop.ts";
-import { measuredValue, metricStatus, planMetrics } from "../metrics.ts";
+import { batchTool, finishTool, runAgent, tool } from "../loop.ts";
+import { dropSpecProxies, implausible, measuredValue, metricStatus, planMetrics } from "../metrics.ts";
 import { budgetLimit, formatMoney, isListingPage, pricesFor, reviewPrices } from "../pricing.ts";
 import { evidenceFor, matchCriterion, saveState, type Candidate, type RunState, type SourceType } from "../state.ts";
 import { makeWebTools, verifyQuote, wasAttempted } from "../tools/web.ts";
@@ -39,6 +39,7 @@ const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 
 export async function researchPhase(state: RunState) {
   if (!state.metricPlan) await planMetrics(state);
+  dropSpecProxies(state);
   saveState(state);
 
   const queue = state.candidates.filter((c) => c.status === "shortlist" && (!c.researched || c.followups.length));
@@ -205,6 +206,9 @@ export function gateProblems(state: RunState, c: Candidate, isFollowup: boolean,
   if (cov.community < 1) problems.push("no community/owner source yet (search '<product> reddit' or owner reviews)");
   const missing = cov.perCriterion.filter((p) => p.count === 0).map((p) => p.name);
   if (missing.length) problems.push(`no findings yet for: ${missing.join(", ")}`);
+  const kinds = [...new Set((state.metricPlan ?? []).flatMap((p) => p.keys).map((k) => state.metricDefs?.[k]?.component).filter((x): x is string => !!x))];
+  const noPart = kinds.filter((k) => !c.components?.[k]);
+  if (noPart.length) problems.push(`record which ${noPart.join(" and ")} this product uses (record_parts), so shared measurements apply to it`);
   if (cov.sellerPrices < 1) problems.push(`no current price from a seller in ${req.region} yet (check the official store and big local retailers, then record_price)`);
   const needed = Math.ceil(cov.planned.length / 2);
   if (cov.confirmed.length < needed) {
@@ -233,12 +237,16 @@ async function researchCandidate(state: RunState, c: Candidate, isRetry: boolean
   const before = evidenceFor(state, c.name).length;
   const pricesBefore = pricesFor(state, c.name).length;
   const currency = req.budget.currency || "local currency";
-  const defs = state.metricDefs ?? {};
+  // Only measurements in the plan (spec-sheet proxies were dropped from it).
+  const planned = new Set((state.metricPlan ?? []).flatMap((p) => p.keys));
+  const defs = Object.fromEntries(Object.entries(state.metricDefs ?? {}).filter(([k]) => planned.has(k)));
+  const partKinds = [...new Set(Object.values(defs).map((d) => d.component).filter((x): x is string => !!x))];
   let rejections = 0;
 
-  const recordEvidence = tool(
+  const recordEvidence = batchTool(
     "record_evidence",
-    "Save ONE concrete finding about this product, with the URL of the page it came from.",
+    "Save concrete findings about this product, each with the URL of the page it came from.",
+    "findings",
     {
       criterion: { type: "string", description: `One of: ${req.criteria.map((c) => c.name).join(", ")}, or "general" (availability, versions...)` },
       finding: { type: "string", description: "Specific and factual: numbers, conditions, who reported it. 1-3 sentences." },
@@ -267,8 +275,9 @@ async function researchCandidate(state: RunState, c: Candidate, isRetry: boolean
       });
       c.dirty = true;
       saveState(state);
-      return `Recorded ${state.evidence.at(-1)!.id} (quote verified). ${coverage(state, c).summary}`;
+      return `Recorded ${state.evidence.at(-1)!.id} (quote verified).`;
     },
+    () => coverage(state, c).summary,
   );
 
   const recordMetric = tool(
@@ -280,12 +289,20 @@ async function researchCandidate(state: RunState, c: Candidate, isRetry: boolean
       source_url: { type: "string" },
       quote: { type: "string", description: "The exact text from the page (or its search result) that shows the number" },
       note: { type: "string", description: "Optional: test conditions or variant (e.g. 'Exynos version')" },
+      component_name: {
+        type: "string",
+        description: "Only for measurements of a shared part (marked [part: ...] in the plan): the exact part measured, e.g. 'AMD Ryzen 5 7530U'. The value then applies to every product with that part.",
+      },
     },
-    ({ metric, value, source_url, note, quote }) => {
+    ({ metric, value, source_url, note, quote, component_name }) => {
       const def = defs[String(metric)];
       if (!def) return `ERROR: unknown measurement "${metric}". Planned: ${Object.keys(defs).join(", ") || "(none)"}.`;
       const v = Number(String(value).replace(/[^0-9.\-]/g, ""));
       if (!Number.isFinite(v)) return "ERROR: value must be a number.";
+      const unitProblem = implausible(def, v);
+      if (unitProblem) return `ERROR: ${unitProblem}`;
+      const part = String(component_name ?? "").trim();
+      if (def.component && !part) return `ERROR: ${def.label} measures the ${def.component}: give component_name (e.g. the exact ${def.component} model).`;
       if (!/^https?:\/\//.test(String(source_url))) return "ERROR: source_url must be the page where you saw it.";
       const err = checkNumberQuote(String(source_url), String(quote ?? ""), v);
       if (err) return err;
@@ -299,7 +316,9 @@ async function researchCandidate(state: RunState, c: Candidate, isRetry: boolean
         note: note ? String(note) : undefined,
         round: state.round,
         quote: String(quote).slice(0, 300),
+        ...(def.component ? { component: part } : {}),
       });
+      if (def.component) c.components = { ...c.components, [def.component]: c.components?.[def.component] ?? part };
       c.dirty = true;
       saveState(state);
       const st = metricStatus(state, c.name, def.key);
@@ -309,9 +328,38 @@ async function researchCandidate(state: RunState, c: Candidate, isRetry: boolean
     ["metric", "value", "source_url", "quote"],
   );
 
-  const recordPrice = tool(
+  // Which shared parts this product uses (e.g. its processor), so measurements of that part apply to it.
+  const recordParts = batchTool(
+    "record_parts",
+    `Save which ${partKinds.join(" / ") || "parts"} this product uses (exact model names), quoting the page that says so.`,
+    "parts",
+    {
+      kind: { type: "string", enum: partKinds.length ? partKinds : undefined, description: "Which part" },
+      name: { type: "string", description: "Exact part model, e.g. 'AMD Ryzen 5 7530U'" },
+      source_url: { type: "string" },
+      quote: { type: "string", description: "Exact text from the page naming the part" },
+    },
+    ({ kind, name, source_url, quote }) => {
+      const k = String(kind ?? "").toLowerCase();
+      if (!partKinds.includes(k)) return `ERROR: kind must be one of: ${partKinds.join(", ")}.`;
+      const n = String(name ?? "").trim();
+      if (n.length < 3) return "ERROR: give the exact part model.";
+      const check = verifyQuote(String(source_url), String(quote ?? ""), { allowSnippet: true });
+      if (check === "not-fetched") return "ERROR: open that page first (or use a search result for it).";
+      if (check === "not-found") return "ERROR: that quote isn't on the page. Copy the text naming the part exactly.";
+      const tokens = n.toLowerCase().split(/\s+/).filter((w) => /\d/.test(w));
+      if (tokens.length && !tokens.some((t) => String(quote).toLowerCase().includes(t))) return `ERROR: the quote must name the part (e.g. contain "${tokens[0]}").`;
+      c.components = { ...c.components, [k]: n };
+      c.dirty = true;
+      saveState(state);
+      return `Recorded ${k}: ${n}.`;
+    },
+  );
+
+  const recordPrice = batchTool(
     "record_price",
-    `Save ONE price you saw for this product. Record every price you come across, including list/MRP prices and prices quoted in articles: code decides which to trust.`,
+    `Save prices you saw for this product. Record every price you come across, including list/MRP prices and prices quoted in articles: code decides which to trust.`,
+    "prices",
     {
       amount: { type: "number", description: "Number only, e.g. 44999" },
       currency: { type: "string", description: `ISO code, e.g. ${currency}` },
@@ -349,8 +397,9 @@ async function researchCandidate(state: RunState, c: Candidate, isRetry: boolean
       state.prices.push(obs);
       c.dirty = true;
       saveState(state);
-      return `Recorded ${obs.id}: ${formatMoney(obs.amount, obs.currency)} (${obs.kind}, ${obs.sourceType}). ${coverage(state, c).summary}`;
+      return `Recorded ${obs.id}: ${formatMoney(obs.amount, obs.currency)} (${obs.kind}, ${obs.sourceType}).`;
     },
+    () => coverage(state, c).summary,
   );
 
   const finish = finishTool(
@@ -399,8 +448,12 @@ async function researchCandidate(state: RunState, c: Candidate, isRetry: boolean
   const metricList = Object.values(defs);
   const metricsText = metricList.length
     ? `\nMeasurements to find (record each with record_metric; these drive the scores, so they matter most):
-${metricList.map((d) => `- ${d.key}: ${d.label} in ${d.unit}. Source: ${d.sourceHint}`).join("\n")}
-Use the named source whenever it has the product, so every product is measured the same way. Make sure it's the right model and variant. If a product isn't covered by that source, skip that measurement rather than substituting a different kind of number.`
+${metricList.map((d) => `- ${d.key}: ${d.label} in ${d.unit}${d.component ? ` [part: ${d.component}]` : ""}. Source: ${d.sourceHint}`).join("\n")}
+Use the named source whenever it has the product, so every product is measured the same way. Make sure it's the right model and variant. If a product isn't covered by that source, skip that measurement rather than substituting a different kind of number. Values must be in the stated unit (convert, e.g. kg to grams).${
+        partKinds.length
+          ? `\nMeasurements marked [part: ...] belong to a part many products share. Record which ${partKinds.join("/")} this product uses with record_parts; if no review of this exact product has the measurement, record the value for that part (e.g. the processor's benchmark) with component_name.`
+          : ""
+      }`
     : "";
 
   const system = `You are a meticulous product researcher investigating ONE product for ONE specific person.
@@ -412,7 +465,8 @@ How to research:
 - Find what expert testers AND real owners say, focused on this person's criteria, must-haves and dealbreakers.
 - Good sources: hands-on or lab reviews, Reddit/forum threads from owners (long-term durability, problems, sizing), official specs, sellers in ${req.region} for real price and availability.
 - Distrust thin affiliate listicles. Check you're reading about the right model/version, since names are often similar across generations.
-- Open pages with fetch_page; search snippets are not evidence.
+- Open pages with fetch_page and say what you're looking for (looking_for); you see the most relevant passages. Search snippets are not evidence.
+- Be economical: after reading a page, record ALL its findings in one record_evidence call and all its prices in one record_price call. Don't open a page you don't need.
 - Record each concrete finding with record_evidence: specific facts (numbers, conditions, who said it), not vague praise. Record negatives as carefully as positives.
 - Every finding, measurement and price needs a VERBATIM quote from its source; code checks it against the page. Only record what the page actually says.
 - Prices: check the CURRENT price at the official store and big retailers in ${req.region} (search e.g. "<product> price ${req.region}" and open seller pages). Record prices from the product's own page, never from search results or listings (they mix in accessories and copies "for" this product). Record every price with record_price. Prices in articles and launch coverage are often months old; record them as "article", never as the current price.${metricsText}
@@ -422,9 +476,16 @@ How to research:
     label: c.name.slice(0, 28),
     system,
     task,
-    tools: [...makeWebTools(), recordEvidence, recordMetric, recordPrice],
+    tools: [
+      ...makeWebTools(undefined, { focus: [c.name, ...req.criteria.map((cr) => `${cr.name} ${cr.description}`), "price", ...partKinds] }),
+      recordEvidence,
+      recordMetric,
+      recordPrice,
+      ...(partKinds.length ? [recordParts] : []),
+    ],
     finish,
-    maxSteps: config.limits.steps.research,
+    // A retry builds on what the first attempt recorded, so it needs fewer steps.
+    maxSteps: isRetry ? Math.ceil(config.limits.steps.research / 2) : config.limits.steps.research,
   });
   saveState(state);
   return result.finished;

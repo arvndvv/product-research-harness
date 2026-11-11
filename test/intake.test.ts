@@ -67,6 +67,9 @@ test("checkTurn rejects near-duplicate questions and enforces the question budge
 test("intake: asks, confirms, saves only stated facts to the profile (scoped)", async () => {
   config.paths.runs = mkdtempSync(join(tmpdir(), "intake-runs-"));
   config.paths.memory = mkdtempSync(join(tmpdir(), "intake-mem-"));
+  // No domain guides or saved factor lists: this test is about the question flow and the profile.
+  config.paths.domains = mkdtempSync(join(tmpdir(), "intake-domains-"));
+  config.paths.knowledge = mkdtempSync(join(tmpdir(), "intake-knowledge-"));
   addProfileFacts([{ text: "OS: Android", scope: "smartphones" }]);
   let call = 0;
   setChatImpl(async (req: ChatRequest) => {
@@ -118,4 +121,21 @@ test("intake: asks, confirms, saves only stated facts to the profile (scoped)", 
   assert.equal(state.requirements?.budget.max, 50000);
   // The guess ("likely small") is dropped; scoped facts keep their scope.
   assert.deepEqual(loadProfile().map((f) => `${f.scope ?? "-"}|${f.text}`), ["smartphones|OS: Android", "-|country: India"]);
+});
+
+test("the interview must account for every decision factor: asked, known, in the brief, or an assumption", async () => {
+  const { unaccountedFactors } = await import("../src/phases/intake.ts");
+  const factors = ["processor performance", "display quality", "refresh rate", "battery life", "weight"];
+  const turn: any = {
+    known: [{ topic: "use", value: "Java, Docker", source: "said" }],
+    requirements: { criteria: [{ name: "performance", weight: 60, description: "fast builds" }, { name: "portability", weight: 40, description: "easy to carry" }], assumptions: [] },
+  };
+  // "weight" is only a JSON key here (criterion weights), so it isn't accounted for yet.
+  assert.deepEqual(unaccountedFactors(factors, turn, []), ["display quality", "refresh rate", "battery life", "weight"]);
+  turn.requirements.assumptions = ["Display: a standard full-HD screen is fine", "Refresh rate: 60 Hz is fine", "Weight: under 1.5 kg"];
+  const qa = [{ question: "How many hours on battery do you need?", answer: "6", resolves: "battery" }];
+  assert.deepEqual(unaccountedFactors(factors, turn, qa), []);
+  // And checkTurn turns that into a fix-it message for the model.
+  const finishing: any = { ...turn, next_question: null, requirements: { ...turn.requirements, assumptions: [] } };
+  assert.match(checkTurn(finishing, [], 0, factors) ?? "", /display quality, refresh rate, battery life, weight/);
 });

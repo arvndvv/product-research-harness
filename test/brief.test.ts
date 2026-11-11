@@ -105,3 +105,59 @@ test("remarks with links queue a follow-up that must open the links, then re-sco
   state.prices.push({ id: "P1", candidate: "Buds X", amount: 9499, currency: "INR", kind: "sale", seller: "shop", url: "https://shop.example/p/buds-x", sourceType: "retailer", round: 1 });
   assert.deepEqual(gateProblems(state, c, true, 0, 0), []);
 });
+
+test("going back to shortlist keeps products and verified findings; going back to discover keeps only yours", async () => {
+  const { restartFrom } = await import("../src/brief.ts");
+  const cand = (name: string, extra: object = {}) => ({ name, status: "shortlist", researched: true, followups: [], notes: ["x"], scores: [{}], total: 70, price: "", whyConsidered: "", source: "", dirty: false, ...extra }) as any;
+  const make = () =>
+    ({
+      phase: "research",
+      round: 1,
+      critiqueNotes: ["c"],
+      reportPath: "r.md",
+      requirements: { criteria: [] },
+      candidates: [cand("A"), cand("B", { status: "cut", cutReason: "not selected" }), cand("C", { status: "cut", cutReason: "Removed by you" }), cand("D", { addedByUser: true })],
+      evidence: [{ candidate: "A" }, { candidate: "D" }],
+      prices: [{ candidate: "A" }],
+      metrics: [],
+      discovery: { brands: ["X"], brandsRuledOut: [{ brand: "Y", reason: "r" }], searches: 9, searchesSinceNew: 3, agentDone: true },
+    }) as any;
+
+  const s1 = make();
+  assert.ok("message" in restartFrom(s1, "shortlist"));
+  assert.equal(s1.phase, "discover");
+  assert.equal(s1.discovery.agentDone, true); // straight to the list review
+  assert.deepEqual(s1.candidates.map((c: any) => c.status), ["longlist", "longlist", "cut", "longlist"]);
+  assert.equal(s1.candidates[0].researched, false);
+  assert.equal(s1.candidates[0].total, undefined);
+  assert.equal(s1.evidence.length, 2); // verified findings are kept and reused
+  assert.equal(s1.round, 0);
+
+  const s2 = make();
+  restartFrom(s2, "discover");
+  assert.deepEqual(s2.candidates.map((c: any) => c.name), ["D"]);
+  assert.deepEqual(s2.evidence, [{ candidate: "D" }]);
+  assert.equal(s2.discovery.agentDone, undefined);
+  assert.deepEqual(s2.discovery.brands, ["X"]);
+
+  assert.ok("error" in restartFrom({ ...make(), phase: "shortlist" }, "shortlist"));
+});
+
+test("a link given with a suggested product must be opened by research (in the note, its own field, or pasted as the name)", async () => {
+  const { addUserCandidate } = await import("../src/brief.ts");
+  const { gateProblems } = await import("../src/phases/research.ts");
+  const state = { phase: "done", round: 0, requirements: { criteria: [], region: "India", budget: { max: 0, currency: "INR", notes: "" } }, candidates: [], evidence: [], prices: [] } as any;
+  const url = "https://www.ezyrefurb.com/products/apple-macbook-air-a2337-m1-8gb-ram-256gb-ssd-refurbished?variant=1&gclid=abc";
+  const r = addUserCandidate(state, "MacBook Air M1", `refurbished is fine ${url}`);
+  assert.deepEqual(r, { name: "MacBook Air M1", start: true });
+  const c = state.candidates[0];
+  assert.equal(c.whyConsidered, "Added by you: refurbished is fine");
+  assert.deepEqual(c.userRemarks[0].links, [url]);
+  assert.match(gateProblems(state, c, false, 0, 0).join("; "), /open the link\(s\) the person gave/);
+
+  // A URL pasted as the name becomes a readable name plus a link to check.
+  const s2 = { ...state, phase: "done", candidates: [] } as any;
+  addUserCandidate(s2, url, "");
+  assert.equal(s2.candidates[0].name, "apple macbook air a2337 m1 8gb ram 256gb ssd refurbished");
+  assert.deepEqual(s2.candidates[0].userRemarks[0].links, [url]);
+});

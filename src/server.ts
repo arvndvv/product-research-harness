@@ -13,14 +13,15 @@
  * Binds to 127.0.0.1 only: there is no auth, so it must not be exposed.
  */
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, readFileSync, renameSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, join, resolve } from "node:path";
-import { addUserCandidate, addUserRemark, applyBriefEdit, planAfterEdit, validateBriefEdit } from "./brief.ts";
+import { addUserCandidate, addUserRemark, applyBriefEdit, planAfterEdit, restartFrom, validateBriefEdit, type RestartStep } from "./brief.ts";
 import { applyUpdate, llmTarget, missingSettings, PROVIDER_PRESETS, SEARCH_OPTIONS, searchSettings, settingsView, validateUpdate, loadSettings } from "./settings.ts";
 import { deleteGuide, draftGuide, guideName, listGuides, listModels, readGuide, testConnection, writeGuide } from "./admin.ts";
 import { config } from "./config.ts";
-import { StopError, withIO, type RunIO } from "./context.ts";
+import { BudgetError, StopError, withIO, type RunIO } from "./context.ts";
+import { defaultRunBudget, overBudget } from "./costs.ts";
 import { addProfileFacts, loadProfile, saveProfile } from "./knowledge.ts";
 import { runPipeline } from "./runner.ts";
 import { eligible, rank } from "./scoring.ts";
@@ -39,6 +40,10 @@ type ActiveRun = {
   pending?: PendingQuestion & { resolve: (answer: string) => void; reject: (e: Error) => void };
   /** Aborting it stops the run (see context.ts). */
   controller?: AbortController;
+  /** Settles when the current pipeline run has fully stopped (after saving). */
+  done?: Promise<void>;
+  /** The live state of a running pipeline (edits like the budget must go here, not to disk). */
+  state?: RunState;
   clients: Set<ServerResponse>;
 };
 const active = new Map<string, ActiveRun>();
@@ -92,7 +97,10 @@ function startRun(state: RunState) {
 
   const controller = new AbortController();
   a.controller = controller;
+  a.state = state;
+  state.budgetUsd ??= defaultRunBudget(); // runs from before budgets existed get the default
   const io: RunIO = {
+    state,
     signal: controller.signal,
     emit: (e) => publish(state.id, e),
     trace: (e) => logEvent(state, e),
@@ -106,13 +114,18 @@ function startRun(state: RunState) {
   };
 
   setStatus(state.id, "running");
-  withIO(io, () => runPipeline(state))
+  a.done = withIO(io, () => runPipeline(state))
     .then(() => setStatus(state.id, "done"))
     .catch((e: Error) => {
       saveState(state);
       a.pending = undefined;
+      if (e instanceof BudgetError) {
+        publish(state.id, { type: "log", level: "warn", text: `Paused: ${e.message}. Everything is saved: raise the budget and Resume to continue.` });
+        setStatus(state.id, "idle");
+        return;
+      }
       if (e instanceof StopError || controller.signal.aborted) {
-        publish(state.id, { type: "log", level: "warn", text: `Stopped by you during "${state.phase}". Progress is saved; Resume continues from here.` });
+        publish(state.id, { type: "log", level: "warn", text: `Paused during "${state.phase}". Progress is saved; Resume continues from here.` });
         setStatus(state.id, "idle");
         return;
       }
@@ -205,7 +218,10 @@ function serveStatic(pathname: string, res: ServerResponse) {
   }
   let file = resolve(WEB_DIST, "." + decodeURIComponent(pathname));
   if (!file.startsWith(WEB_DIST) || !existsSync(file) || statSync(file).isDirectory()) file = join(WEB_DIST, "index.html"); // SPA fallback
-  res.writeHead(200, { "Content-Type": MIME[extname(file)] ?? "application/octet-stream" });
+  // index.html must never be cached, or the browser keeps loading the previous build after an update.
+  // Built assets have content hashes in their names, so they can be cached forever.
+  const cache = file.includes(`${join("web", "dist", "assets")}`) ? "public, max-age=31536000, immutable" : "no-cache";
+  res.writeHead(200, { "Content-Type": MIME[extname(file)] ?? "application/octet-stream", "Cache-Control": cache });
   res.end(readFileSync(file));
 }
 
@@ -264,7 +280,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
 
     if (action === "/brief" && method === "PUT") {
       const a = active.get(id);
-      if (a && (a.status === "running" || a.status === "waiting")) return sendJson(res, 409, { error: "stop the research before adjusting the brief" });
+      if (a && (a.status === "running" || a.status === "waiting")) return sendJson(res, 409, { error: "pause the research before adjusting the brief" });
       const edit = await readJson(req);
       const state = loadState(runDir(id));
       const problem = validateBriefEdit(state, edit);
@@ -281,10 +297,10 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
 
     if (action === "/candidates" && method === "POST") {
       const a = active.get(id);
-      if (a && (a.status === "running" || a.status === "waiting")) return sendJson(res, 409, { error: "wait for the research to finish, or stop it, before adding a product" });
-      const { name, note } = await readJson(req);
+      if (a && (a.status === "running" || a.status === "waiting")) return sendJson(res, 409, { error: "wait for the research to finish, or pause it, before adding a product" });
+      const { name, note, links } = await readJson(req);
       const state = loadState(runDir(id));
-      const result = addUserCandidate(state, String(name ?? ""), String(note ?? ""));
+      const result = addUserCandidate(state, String(name ?? ""), String(note ?? ""), Array.isArray(links) ? links.map(String) : []);
       if ("error" in result) return sendJson(res, 400, { error: result.error });
       saveState(state);
       publish(id, { type: "log", level: "info", text: `You added ${result.name} to the comparison${note ? ` (${note})` : ""}` });
@@ -295,7 +311,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
 
     if (action === "/remarks" && method === "POST") {
       const a = active.get(id);
-      if (a && (a.status === "running" || a.status === "waiting")) return sendJson(res, 409, { error: "wait for the research to finish, or stop it, before adding a remark" });
+      if (a && (a.status === "running" || a.status === "waiting")) return sendJson(res, 409, { error: "wait for the research to finish, or pause it, before adding a remark" });
       const { name, text, links } = await readJson(req);
       const state = loadState(runDir(id));
       const result = addUserRemark(state, String(name ?? ""), String(text ?? ""), Array.isArray(links) ? links.map(String) : []);
@@ -315,9 +331,38 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       return sendJson(res, 200, { ok: true });
     }
 
+    if (action === "/budget" && method === "PUT") {
+      const usd = Number((await readJson(req)).usd);
+      if (!Number.isFinite(usd) || usd < 0) return sendJson(res, 400, { error: "budget must be 0 (no limit) or more" });
+      // A running pipeline holds the live state: change it there so it isn't overwritten.
+      const live = active.get(id)?.state;
+      const state = live && (active.get(id)!.status === "running" || active.get(id)!.status === "waiting") ? live : loadState(runDir(id));
+      state.budgetUsd = Math.round(usd * 100) / 100;
+      saveState(state);
+      publish(id, { type: "log", level: "info", text: `Run budget set to ${usd ? `$${state.budgetUsd.toFixed(2)}` : "no limit"}` });
+      return sendJson(res, 200, { budgetUsd: state.budgetUsd });
+    }
+
+    if (action === "/restart" && method === "POST") {
+      const { step } = await readJson(req);
+      const a = active.get(id);
+      if (a && (a.status === "running" || a.status === "waiting")) return sendJson(res, 409, { error: "pause the research before going back to an earlier step" });
+      const state = loadState(runDir(id));
+      const result = restartFrom(state, String(step) as RestartStep);
+      if ("error" in result) return sendJson(res, 400, { error: result.error });
+      // Keep the old recommendation for reference, but don't show it as current.
+      const report = join(runDir(id), "report.md");
+      if (existsSync(report)) renameSync(report, join(runDir(id), `report-before-restart-${Date.now()}.md`));
+      saveState(state);
+      publish(id, { type: "log", level: "info", text: `Went back to ${step}: ${result.message}` });
+      startRun(state);
+      return sendJson(res, 200, { message: result.message });
+    }
+
     if (action === "/resume" && method === "POST") {
       const state = loadState(runDir(id));
       if (state.phase === "done") return sendJson(res, 400, { error: "run is already finished" });
+      if (overBudget(state)) return sendJson(res, 409, { error: "this run is at its budget: raise the budget first" });
       startRun(state);
       return sendJson(res, 200, summarize(state));
     }

@@ -5,7 +5,7 @@
  * The harness never imports a vendor SDK. Swapping models = changing .env.
  */
 import { config } from "./config.ts";
-import { log, requestSignal, sleep, throwIfStopped, trace } from "./context.ts";
+import { chargeUsage, checkBudget, log, requestSignal, sleep, throwIfStopped, trace } from "./context.ts";
 import { llmTarget } from "./settings.ts";
 
 export type ToolCall = {
@@ -73,6 +73,7 @@ async function httpChat(req: ChatRequest): Promise<AssistantMessage> {
   }
   if (req.json) body.response_format = { type: "json_object" };
 
+  checkBudget();
   for (let attempt = 1; ; attempt++) {
     throwIfStopped();
     const started = Date.now();
@@ -103,6 +104,7 @@ async function httpChat(req: ChatRequest): Promise<AssistantMessage> {
           }))
         : undefined;
       const reply: AssistantMessage = { role: "assistant", content: contentToText(msg.content), tool_calls: toolCalls };
+      chargeUsage({ model: llm.model, baseUrl: llm.baseUrl, usage: data.usage });
       trace({
         type: "llm",
         profile,

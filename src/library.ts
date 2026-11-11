@@ -52,6 +52,17 @@ function writeJson(file: string, value: unknown) {
   writeFileSync(file, JSON.stringify(value, null, 2));
 }
 
+// --- Decision factors --------------------------------------------------------------
+
+/** What buyers of this category weigh (display, battery, ports...): the interview must account for each. */
+export function loadFactors(category: string): string[] {
+  return readJson(join(dir(category), "factors.json"), [] as string[]);
+}
+
+export function saveFactors(category: string, factors: string[]) {
+  writeJson(join(dir(category), "factors.json"), factors);
+}
+
 // --- Measurement definitions ----------------------------------------------------
 
 export function loadMetricLibrary(category: string): Record<string, MetricDef> {
@@ -62,6 +73,14 @@ export function loadMetricLibrary(category: string): Record<string, MetricDef> {
  * Add new definitions. Existing keys are never overwritten: keeping the same
  * scale is what makes scores comparable between runs.
  */
+/** Mark an existing measurement as one of a shared part (e.g. "processor"). The scale is untouched. */
+export function setMetricComponent(category: string, key: string, component: string) {
+  const lib = loadMetricLibrary(category);
+  if (!lib[key] || lib[key].component) return;
+  lib[key] = { ...lib[key], component };
+  writeJson(join(dir(category), "metrics.json"), lib);
+}
+
 export function mergeMetricLibrary(category: string, defs: MetricDef[]): Record<string, MetricDef> {
   const lib = loadMetricLibrary(category);
   for (const d of defs) if (!lib[d.key]) lib[d.key] = d;

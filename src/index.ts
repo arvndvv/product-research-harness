@@ -37,7 +37,7 @@ async function main() {
   if (judge.model !== main.model || judge.baseUrl !== main.baseUrl) console.log(`Judge model: ${judge.model} @ ${judge.baseUrl}`);
   console.log(`Search: ${searchSettings().provider}  (change in the app: Profile > Models & search, or settings.json)`);
 
-  await withIO({ ask: cliAsk, emit: printEvent, trace: (e) => logEvent(state, e) }, () => runPipeline(state));
+  await withIO({ state, ask: cliAsk, emit: printEvent, trace: (e) => logEvent(state, e) }, () => runPipeline(state));
 }
 
 main()

@@ -17,7 +17,9 @@ export function ranked(candidates: Candidate[]) {
 // --- Interview transcript ---------------------------------------------------------
 
 export function Interview({ events }: { events: RunEvent[] }) {
-  const turns = events.filter((e) => e.type === "question" || e.type === "answer");
+  // The longlist review isn't part of the interview transcript (its reply is JSON).
+  const reviewIds = new Set(events.flatMap((e) => (e.type === "question" && e.question.longlist ? [e.question.id] : [])));
+  const turns = events.filter((e) => (e.type === "question" && !e.question.longlist) || (e.type === "answer" && !reviewIds.has(e.questionId)));
   if (!turns.length) return <Empty>The interview hasn't started yet.</Empty>;
   return (
     <div className="space-y-3">
@@ -164,8 +166,9 @@ export function Candidates({ state, runId, canEdit, onNotice }: { state: RunStat
       )}
 
       {pending.length > 0 && <CandidateList title="Being researched" items={pending} />}
-      {longlist.length > 0 && <CandidateList title="Longlist" items={longlist} />}
-      {cut.length > 0 && <CandidateList title="Cut" items={cut} muted />}
+      {longlist.length > 0 && <CandidateList title="Longlist" items={longlist} edit={{ runId, canEdit, onNotice }} />}
+      {cut.length > 0 && <CandidateList title="Cut" items={cut} muted edit={{ runId, canEdit, onNotice }} />}
+      {state.discovery && <DiscoveryCoverage state={state} />}
     </div>
   );
 }
@@ -260,11 +263,15 @@ function ScoreRow({
                           className={cx("rounded px-1.5 py-0.5 text-xs", m.confirmed === false ? "bg-amber-50 text-amber-900" : "bg-sky-50 text-sky-900")}
                           title={m.confirmed === false ? "Single source: not confirmed by the authoritative site or a second source" : "Confirmed: authoritative source, or two sources agree"}
                         >
-                          {m.label}: {m.value} {m.unit} → {m.score}/10{m.confirmed === false ? " (1 source)" : " ✓"}
+                          {m.label}: {m.value} {m.unit} → {m.score}/10{m.confirmed === false ? " (1 source, counts half)" : " ✓"}
+                          {m.via && <span className="opacity-70"> · same {m.via}</span>}
                         </span>
                       ))}
                     </div>
                   )}
+                  {s.leftOut?.length ? (
+                    <div className="mt-0.5 text-xs text-zinc-500">Not used: {s.leftOut.join(", ")} (not measured for every product, so it can't rank them fairly)</div>
+                  ) : null}
                   <div className="mt-0.5 text-zinc-700">
                     {s.rationale}
                     {s.evidenceIds.length > 0 && <span className="text-xs text-zinc-400"> ({s.evidenceIds.slice(0, 6).join(", ")})</span>}
@@ -397,7 +404,79 @@ function Remarks({ c, edit }: { c: Candidate; edit: EditProps }) {
   );
 }
 
-function CandidateList({ title, items, muted }: { title: string; items: Candidate[]; muted?: boolean }) {
+const ANGLE_LABEL: Record<string, string> = {
+  expert_review: "expert reviews",
+  community: "owner threads",
+  retailer_list: "retailer lists in range",
+  new_launch: "recent launches",
+  earlier_research: "earlier research",
+  other: "other",
+};
+
+/** How discovery searched: which angles found products, which brands were checked, and whether it saturated. */
+function DiscoveryCoverage({ state }: { state: RunState }) {
+  const d = state.discovery!;
+  const key = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const angles = ["expert_review", "community", "retailer_list", "new_launch"].map((a) => ({ a, n: state.candidates.filter((c) => c.foundVia?.includes(a as never)).length }));
+  const brandRows = d.brands.map((b) => {
+    const products = state.candidates.filter((c) => key(c.name).includes(key(b)));
+    const ruled = d.brandsRuledOut.find((r) => key(r.brand) === key(b));
+    return { b, products, ruled };
+  });
+  return (
+    <div className="rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm">
+      <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">How products were found</div>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {angles.map(({ a, n }) => (
+          <Chip key={a} tone={n ? "green" : "amber"}>
+            {ANGLE_LABEL[a]}: {n}
+          </Chip>
+        ))}
+        <Chip tone={d.searchesSinceNew >= 3 ? "green" : "amber"}>
+          {d.searches} searches, last {d.searchesSinceNew} found nothing new
+        </Chip>
+      </div>
+      {brandRows.length > 0 && (
+        <div className="mt-3">
+          <div className="text-xs text-zinc-500">Brands checked</div>
+          <ul className="mt-1 grid gap-x-6 gap-y-0.5 sm:grid-cols-2">
+            {brandRows.map(({ b, products, ruled }) => (
+              <li key={b} className="text-xs">
+                <span className="font-medium text-zinc-800">{b}</span>{" "}
+                {products.length ? (
+                  <span className="text-zinc-500">{products.map((p) => p.name).join(", ")}</span>
+                ) : ruled ? (
+                  <span className="text-zinc-500">left out: {ruled.reason}</span>
+                ) : (
+                  <span className="text-amber-700">not checked</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {d.gaps && <p className="mt-2 text-xs text-amber-700">Coverage gap: {d.gaps}</p>}
+      <p className="mt-2 text-xs text-zinc-500">Know a product that should be here? Use "Suggest a product to compare" above, or "Compare this too" on a cut one.</p>
+    </div>
+  );
+}
+
+function CandidateList({ title, items, muted, edit }: { title: string; items: Candidate[]; muted?: boolean; edit?: EditProps }) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  async function compare(c: Candidate) {
+    if (!edit) return;
+    setBusy(c.name);
+    setError(null);
+    try {
+      const r = await api.addCandidate(edit.runId, c.name, "");
+      edit.onNotice(r.started ? `Researching ${r.name} now; then everything is re-scored.` : `${r.name} added. It's researched when you resume.`);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  }
   return (
     <div>
       <div className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-500">
@@ -411,12 +490,21 @@ function CandidateList({ title, items, muted }: { title: string; items: Candidat
                 {c.name}
                 {c.addedByUser && <span className="ml-2 align-middle"><Chip tone="sky">added by you</Chip></span>}
               </span>
-              {c.price && <span className="shrink-0 text-xs text-zinc-500">{c.price}</span>}
+              <span className="flex shrink-0 items-center gap-3">
+                {c.price && <span className="text-xs text-zinc-500">{c.price}</span>}
+                {edit?.canEdit && (
+                  <Button variant="ghost" className="px-2 py-0.5 text-xs" onClick={() => compare(c)} disabled={busy !== null}>
+                    {busy === c.name ? "Adding..." : "Compare this too"}
+                  </Button>
+                )}
+              </span>
             </div>
             <div className="mt-0.5 text-xs text-zinc-500">{c.cutReason ?? c.whyConsidered}</div>
+            {c.foundVia?.length ? <div className="mt-0.5 text-xs text-zinc-400">found via {c.foundVia.map((v) => ANGLE_LABEL[v] ?? v).join(", ")}</div> : null}
           </li>
         ))}
       </ul>
+      {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
     </div>
   );
 }

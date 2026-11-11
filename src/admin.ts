@@ -101,8 +101,14 @@ export async function draftGuide(name: string): Promise<string> {
         role: "system",
         content: `You write a short domain guide in Markdown for a product-research assistant. It's injected into the assistant's prompts when someone researches this category.
 
-Sections: "# Domain guide: <category>", "## What actually matters" (the factors that really separate good from bad products, with the measurable specs and typical ranges), "## Sources" (types of reliable sources: lab tests, specialist reviewers, owner communities; name well-known ones only if you're confident they exist), "## Pitfalls" (version confusion, misleading specs, regional differences).
-Be concrete and concise (under 400 words). No prices. Say so when something is a general rule of thumb.${example ? `\n\nExample of the style (a guide for shoes):\n${example}` : ""}`,
+Sections:
+- "# Domain guide: <category>"
+- "## Decision factors": a bullet list of 6-12 factors buyers weigh, each "- **Name**: one line on what to check". The interview makes sure each is asked or shown as an assumption.
+- "## What actually matters": what really separates good from bad products, with typical ranges.
+- "## Measurements": a markdown table "| key | label | unit | better | poor | good | source | part |" of MEASURED outcomes (benchmarks, lab tests, weight) with a fixed scale: poor = a weak product today, good = an excellent one; better = "higher" or "lower"; source = the testing site's domain; part = a shared component it measures (e.g. processor) or "-". Never specs like power rating, core count or megapixels. Leave the table out if no comparable numbers are published.
+- "## Sources" (lab tests, specialist reviewers, owner communities; name well-known ones only if you're confident they exist)
+- "## Pitfalls" (version confusion, misleading specs, regional differences).
+Be concrete and concise (under 600 words). No prices. Say so when something is a general rule of thumb.${example ? `\n\nExample of the style (a guide for shoes):\n${example}` : ""}`,
       },
       { role: "user", content: `Category: ${name.replace(/-/g, " ")}` },
     ],

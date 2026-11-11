@@ -12,7 +12,8 @@
  * through every function.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { LogLevel, PendingQuestion, RunEventInput } from "./shared.ts";
+import { defaultRunBudget, overBudget, recordUsage, type Usage } from "./costs.ts";
+import type { LogLevel, PendingQuestion, RunEventInput, RunState } from "./shared.ts";
 import { cliAsk, printEvent } from "./ui.ts";
 
 export type AskOptions = Omit<PendingQuestion, "id" | "question">;
@@ -22,14 +23,24 @@ export type RunIO = {
   emit(event: RunEventInput): void;
   /** Low-level diagnostics (model calls etc.), written to log.jsonl. */
   trace(event: Record<string, unknown>): void;
-  /** Aborted when the person presses Stop. */
+  /** Aborted when the person presses Pause. */
   signal?: AbortSignal;
+  /** The run being worked on: model costs are added to it and checked against its budget. */
+  state?: RunState;
 };
+
+/** Thrown before a model call when the run has reached its budget. Progress is saved; raise the budget and Resume. */
+export class BudgetError extends Error {
+  constructor(usd: number, budget: number) {
+    super(`This run reached its budget: $${usd.toFixed(2)} of $${budget.toFixed(2)}`);
+    this.name = "BudgetError";
+  }
+}
 
 /** Thrown when a run is stopped on purpose. Progress is saved; Resume continues. */
 export class StopError extends Error {
   constructor() {
-    super("Stopped by you");
+    super("Paused by you");
     this.name = "StopError";
   }
 }
@@ -47,6 +58,18 @@ export const log = (text: string, level: LogLevel = "info") => currentIO().emit(
 export const ask = (question: string, opts?: AskOptions) => currentIO().ask(question, opts);
 export const emit = (event: RunEventInput) => currentIO().emit(event);
 export const trace = (event: Record<string, unknown>) => currentIO().trace(event);
+
+/** Before a model call: stop if the run has used up its budget. */
+export function checkBudget() {
+  const state = currentIO().state;
+  if (state && overBudget(state)) throw new BudgetError(state.cost?.usd ?? 0, state.budgetUsd ?? defaultRunBudget());
+}
+
+/** After a model call: add what it cost to the run. */
+export function chargeUsage(call: { model: string; baseUrl: string; usage?: Usage }) {
+  const state = currentIO().state;
+  if (state) recordUsage(state, call);
+}
 
 /**
  * Cancellation. The loop calls throwIfStopped() between steps; network calls

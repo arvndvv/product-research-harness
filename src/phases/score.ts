@@ -25,7 +25,8 @@ import { config } from "../config.ts";
 import { log, throwIfStopped } from "../context.ts";
 import { evidenceBlock, requirementsBlock } from "../format.ts";
 import { chatJSON } from "../llm.ts";
-import { metricScoreFor } from "../metrics.ts";
+import { domainBlock } from "../knowledge.ts";
+import { comparableKeys, dropSpecProxies, metricScoreFor } from "../metrics.ts";
 import { budgetLimit, budgetVerdict, bestPrice, formatMoney } from "../pricing.ts";
 import { computeTotal, eligible, rank } from "../scoring.ts";
 import { evidenceFor, saveState, type Candidate, type RunState, type Score } from "../state.ts";
@@ -47,9 +48,14 @@ export function computeConfidence(coverage: number, planned: number, findings: n
 }
 
 /** Combine measurement and judgement into the final 0-10. */
-export function combineScores(metricScore: number | undefined, judgedScore: number): number {
+/**
+ * Final score for a criterion: measurements carry METRIC_WEIGHT (0.7), the
+ * side-by-side judgement the rest. Measurements from a single source count half
+ * as much until a second source (or the authoritative site) confirms them.
+ */
+export function combineScores(metricScore: number | undefined, judgedScore: number, confirmedShare = 1): number {
   if (metricScore === undefined) return round1(judgedScore);
-  const w = config.scoring.metricWeight;
+  const w = config.scoring.metricWeight * (0.5 + 0.5 * Math.max(0, Math.min(1, confirmedShare)));
   return round1(w * metricScore + (1 - w) * judgedScore);
 }
 
@@ -65,29 +71,38 @@ export async function scorePhase(state: RunState) {
       await judgeRules(state, c);
     }
 
+    // Measurements only count when every product has them: products are never
+    // ranked on different numbers. (Thinly researched products don't block this.)
+    dropSpecProxies(state);
+    const comparedOn = shortlist.filter((c) => !c.incomplete).length >= 2 ? shortlist.filter((c) => !c.incomplete) : shortlist;
+    const common = new Map(req.criteria.map((cr) => [cr.name, comparableKeys(state, comparedOn.map((c) => c.name), cr.name)]));
+    for (const [cr, { leftOut }] of common) if (leftOut.length) log(`${cr}: not using ${leftOut.join(", ")} (not measured for every product); compared side by side instead`, "warn");
+
     // 2. Each criterion, all products side by side. Products are compared
     //    together, so any change means re-comparing everyone.
     const judged = new Map<string, Map<string, { score: number; rationale: string; spread: number }>>();
     for (const cr of req.criteria) {
       throwIfStopped();
       log(`Comparing all products on "${cr.name}" (${Math.max(1, config.scoring.judgeSamples)} passes, products in a different order each time)`);
-      judged.set(cr.name, await compareOnCriterion(state, shortlist, cr.name));
+      judged.set(cr.name, await compareOnCriterion(state, shortlist, cr.name, common.get(cr.name)!.keys));
     }
 
     // 3. Combine with measurements, in code.
     for (const c of shortlist) {
       const ev = evidenceFor(state, c.name);
       c.scores = req.criteria.map((cr): Score => {
-        const m = metricScoreFor(state, c.name, cr.name);
+        const { keys, leftOut } = common.get(cr.name)!;
+        const m = metricScoreFor(state, c.name, cr.name, keys);
         const j = judged.get(cr.name)!.get(c.name) ?? { score: 5, rationale: "not compared", spread: 0 };
         const crEv = ev.filter((e) => e.criterion === cr.name);
         const cited = [...new Set(j.rationale.match(/\bE\d+\b/g) ?? [])].filter((id) => crEv.some((e) => e.id === id));
         return {
           criterion: cr.name,
-          score: combineScores(m.score, j.score),
+          score: combineScores(m.score, j.score, m.confirmedShare),
           metricScore: m.score,
           judgedScore: j.score,
           measured: m.measured,
+          ...(leftOut.length ? { leftOut } : {}),
           confidence: computeConfidence(m.coverage, m.planned, crEv.length, new Set(crEv.map((e) => e.sourceType)).size),
           evidenceIds: cited.length ? cited : crEv.map((e) => e.id),
           rationale: j.rationale,
@@ -163,12 +178,12 @@ const medianOf = (xs: number[]) => {
  * with the products in different orders and take each product's median:
  * models favour whatever they read first, and a single call can wobble.
  */
-async function compareOnCriterion(state: RunState, products: Candidate[], criterion: string) {
+async function compareOnCriterion(state: RunState, products: Candidate[], criterion: string, keys: string[]) {
   const samples = Math.max(1, config.scoring.judgeSamples);
   const runs: Map<string, { score: number; rationale: string }>[] = [];
   for (let i = 0; i < samples; i++) {
     throwIfStopped();
-    runs.push(await compareOnce(state, sampleOrder(products, i), criterion));
+    runs.push(await compareOnce(state, sampleOrder(products, i), criterion, keys));
   }
   return new Map(
     products.map((c) => {
@@ -181,7 +196,7 @@ async function compareOnCriterion(state: RunState, products: Candidate[], criter
   );
 }
 
-async function compareOnce(state: RunState, products: Candidate[], criterion: string) {
+async function compareOnce(state: RunState, products: Candidate[], criterion: string, keys: string[]) {
   const req = state.requirements!;
   const cr = req.criteria.find((c) => c.name === criterion)!;
   // Products are referred to by id (P1, P2...), not by name. Models "correct" names,
@@ -193,7 +208,8 @@ async function compareOnce(state: RunState, products: Candidate[], criterion: st
     return scores.find((x) => String(x?.id ?? "").trim().toUpperCase() === id) ?? findScore(scores, c.name);
   };
   const blocks = products.map((c, i) => {
-    const m = metricScoreFor(state, c.name, criterion);
+    // Only measurements every product has: the judge compares like with like.
+    const m = metricScoreFor(state, c.name, criterion, keys);
     const measured = m.measured.length ? m.measured.map((x) => `${x.label}: ${x.value} ${x.unit}${x.confirmed ? "" : " (single source)"}`).join("; ") : "none found";
     const ev = evidenceFor(state, c.name).filter((e) => e.criterion === criterion);
     return `### P${i + 1}: ${c.name}\nMeasurements: ${measured}\nFindings:\n${evidenceBlock(ev)}`;
@@ -209,12 +225,15 @@ Person and requirements:
 ${requirementsBlock(req, { rules: false })}
 
 Criterion: ${cr.name}. What good means for this person: ${cr.description}
+${domainBlock(req.category)}
 
 How to score (0-10, half points allowed):
 - Compare the products WITH EACH OTHER. If A is clearly better than B on this criterion, A must score higher; similar products get similar scores.
 - Measurements are objective and measured the same way for each product: when they exist, they outweigh the tone of reviews. Reviews of expensive products are often harsher because expectations are higher; don't let that make a better product score lower.
 - Anchor the scale to the category, not to this list: 10 = among the best available today, 5 = average, 2 = clearly weak.
 - Use only the findings and measurements given. With little evidence, stay near 5.
+- Score only differences that matter for THIS person's description of the criterion. If several products meet it equally (e.g. each runs one of the operating systems they accept), give them the SAME score. Never reward something they didn't ask for, and don't use reputation or general knowledge in place of the findings.
+- Scores above 8 or below 3 are strong claims: they need a finding that supports them, cited by id. Otherwise stay between 3 and 8.
 - Rationale: one sentence, citing evidence ids like E12.
 
 JSON, one entry per product, using its id from the heading: {"scores":[{"id":"P1","product":"<name>","score":0,"rationale":"..."}]}`,
@@ -230,6 +249,12 @@ JSON, one entry per product, using its id from the heading: {"scores":[{"id":"P1
           const s = pick(v.scores, c);
           if (!s) return `missing score for ${[...ids].find(([, n]) => n === c.name)![0]} (${c.name}); include its "id"`;
           if (!Number.isFinite(Number(s.score)) || Number(s.score) < 0 || Number(s.score) > 10) return `score for "${c.name}" must be a number 0-10`;
+          // Extreme scores must rest on evidence about THAT product, not reputation.
+          const cited = String(s.rationale ?? "").match(/\bE\d+\b/g) ?? [];
+          const own = new Set(evidenceFor(state, c.name).map((e) => e.id));
+          const extreme = Number(s.score) > 8 || Number(s.score) < 3;
+          if (extreme && !cited.some((id) => own.has(id)) && !metricScoreFor(state, c.name, criterion, keys).measured.length)
+            return `${c.name} got ${s.score} without citing a finding about it: cite the E-id that supports it, or score between 3 and 8`;
         }
         return null;
       },

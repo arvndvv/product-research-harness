@@ -53,12 +53,20 @@ export const config = {
   limits: {
     minLonglist: num("MIN_LONGLIST", 6),
     maxShortlist: num("MAX_SHORTLIST", 5),
+    /** Discovery may finish only after this many searches in a row found no new product. */
+    discoverSaturation: num("DISCOVER_SATURATION", 3),
+    /** Above this many products the longlist counts as saturated anyway. */
+    maxLonglist: num("MAX_LONGLIST", 20),
+    /** Pause after discovery so the person can remove, add or ask for more products. */
+    reviewLonglist: process.env.REVIEW_LONGLIST !== "0",
     minEvidence: num("MIN_EVIDENCE", 6),
     minDistinctSites: 3,
     maxRounds: num("MAX_ROUNDS", 2),
     maxFetchesPerTask: num("MAX_FETCHES_PER_TASK", 12),
-    pageChars: num("PAGE_CHARS", 8000), // lower this for small-context local models
-    steps: { discover: 30, research: 25 },
+    // Characters of each page shown to the model. Research shows the most relevant
+    // passages up to this size (the full page is still used to verify quotes).
+    pageChars: num("PAGE_CHARS", 3500),
+    steps: { discover: 45, research: 20 },
     /** Most questions the interview may ask (corrections at the confirm step don't count). */
     intakeQuestions: num("INTAKE_MAX_QUESTIONS", 6),
     /** Products whose list price is up to this % over budget are still considered, since sale prices are often lower. */

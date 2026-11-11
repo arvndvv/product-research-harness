@@ -101,3 +101,20 @@ test("run ids are unique even for the same request in the same minute", async ()
   assert.notEqual(a.id, b.id);
   assert.notEqual(a.dir, b.dir);
 });
+
+test("domain guides: decision factors drive the interview, the measurement table seeds measurements", async () => {
+  const { config } = await import("../src/config.ts");
+  const { domainBlock, domainFactors, domainMetrics } = await import("../src/knowledge.ts");
+  config.paths.domains = new URL("../domains", import.meta.url).pathname;
+  const factors = domainFactors("laptop");
+  assert.ok(factors.includes("Refresh rate") && factors.includes("Processor performance"), factors.join(", "));
+  const metrics = domainMetrics("laptops for coding");
+  const gb = metrics.find((m) => m.key === "geekbench_6_multi_core")!;
+  assert.deepEqual({ poor: gb.poor, good: gb.good, higher: gb.higherIsBetter, part: gb.component, domain: gb.sourceDomain }, { poor: 5000, good: 15000, higher: true, part: "processor", domain: "browser.geekbench.com" });
+  assert.equal(metrics.find((m) => m.key === "laptop_weight_g")!.higherIsBetter, false);
+  // The table is for code; prompts get the rest of the guide.
+  const block = domainBlock("laptop");
+  assert.ok(!block.includes("| geekbench_6_multi_core") && block.includes("## Pitfalls"));
+  assert.ok(domainFactors("wireless earbuds").includes("Noise cancelling (ANC)"));
+  assert.ok(domainMetrics("smartphone").some((m) => m.key === "dxomark_camera_score"));
+});

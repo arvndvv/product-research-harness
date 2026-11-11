@@ -73,3 +73,126 @@ test("judge scores match product names loosely but never ambiguously", async () 
   // "Galaxy S25" would match both "S25" and "S25 FE": refuse rather than guess.
   assert.equal(findScore([{ product: "Samsung Galaxy S25" }, { product: "Samsung Galaxy S25 FE" }], "Galaxy S25"), undefined);
 });
+
+test("discovery can't finish without every angle, every brand and a saturated search", async () => {
+  const { discoveryProblems } = await import("../src/phases/discover.ts");
+  const cand = (name: string, via: string, site: string) => ({ name, foundVia: [via], source: `https://${site}/x`, status: "longlist" }) as any;
+  const state = {
+    candidates: [
+      cand("realme Buds T310", "expert_review", "a.com"),
+      cand("OnePlus Nord Buds 3", "community", "b.com"),
+      cand("boAt Nirvana Ion", "retailer_list", "c.com"),
+      cand("Noise Buds N2", "expert_review", "a.com"),
+      cand("JBL Wave Beam 2", "community", "b.com"),
+      cand("realme Buds Air 6", "retailer_list", "c.com"),
+    ],
+    discovery: { brands: ["realme", "OnePlus", "boAt", "Noise", "JBL", "Sony"], brandsRuledOut: [{ brand: "Sony", reason: "too" }], searches: 9, searchesSinceNew: 1 },
+  } as any;
+  const p = discoveryProblems(state).join(" | ");
+  assert.match(p, /no product found via: new_launch/);
+  assert.match(p, /brands not accounted for: Sony/); // a 3-letter reason isn't a reason
+  assert.match(p, /hasn't saturated/);
+  state.candidates.push(cand("CMF Buds 2", "new_launch", "d.com"));
+  state.discovery.brandsRuledOut = [{ brand: "Sony", reason: "nothing under the budget in India" }];
+  state.discovery.searchesSinceNew = 3;
+  assert.deepEqual(discoveryProblems(state), []);
+});
+
+test("longlist review: remove, add, search more, and added products are always researched", async () => {
+  const { discoverPhase, parseLonglistReview } = await import("../src/phases/discover.ts");
+  const { withIO } = await import("../src/context.ts");
+  const { config } = await import("../src/config.ts");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  config.paths.runs = mkdtempSync(join(tmpdir(), "review-"));
+
+  assert.deepEqual(parseLonglistReview(""), { action: "continue", remove: [], add: [], hint: "" });
+  assert.deepEqual(parseLonglistReview("remove: A, B\nadd: C\nmore: gaming laptops"), { action: "more", remove: ["A", "B"], add: ["C"], hint: "gaming laptops" });
+
+  const c = (name: string) => ({ name, status: "longlist", price: "", whyConsidered: "", source: "", foundVia: ["expert_review"], followups: [], notes: [], researched: false }) as any;
+  const state = {
+    id: "t", dir: config.paths.runs, phase: "discover", round: 0, candidates: [c("Alpha One"), c("Beta Two"), c("Gamma Three")], evidence: [],
+    requirements: { category: "x", summary: "s", useCase: "u", region: "India", budget: { max: 0, currency: "INR", notes: "" }, criteria: [], mustHaves: [], niceToHaves: [], dealbreakers: [], userProfile: [] },
+    critiqueNotes: [], createdAt: "2026-01-01", initialRequest: "t",
+    discovery: { brands: [], brandsRuledOut: [], searches: 5, searchesSinceNew: 3, agentDone: true },
+  } as any;
+  const asked: any[] = [];
+  config.limits.reviewLonglist = true;
+  try {
+    await withIO(
+      {
+        emit: () => {},
+        trace: () => {},
+        ask: async (_q, opts) => {
+          asked.push(opts?.longlist?.map((x: any) => x.name));
+          return JSON.stringify({ action: "continue", remove: ["Beta Two"], add: ["Delta Four"], hint: "" });
+        },
+      },
+      () => discoverPhase(state),
+    );
+  } finally {
+    config.limits.reviewLonglist = false;
+  }
+  assert.deepEqual(asked, [["Alpha One", "Beta Two", "Gamma Three"]]);
+  const by = (n: string) => state.candidates.find((x: any) => x.name === n);
+  assert.equal(by("Beta Two").status, "cut");
+  assert.equal(by("Beta Two").cutReason, "Removed by you");
+  assert.equal(by("Delta Four").addedByUser, true);
+  assert.equal(state.phase, "shortlist");
+});
+
+test("measurements: no spec proxies, unit sanity, same numbers for everyone, shared parts, single sources count half", async () => {
+  const { specProxy, implausible, comparableKeys, metricScoreFor, dropSpecProxies } = await import("../src/metrics.ts");
+  const { combineScores } = await import("../src/phases/score.ts");
+  const def = (key: string, label: string, unit: string, poor: number, good: number, extra: object = {}) => ({ key, label, unit, higherIsBetter: good > poor, poor, good, sourceHint: "", ...extra });
+
+  // 1. Specs are not measurements: the laptop run scored a 15 W chip 10/10 for "performance".
+  assert.ok(specProxy(def("cpu_thermal_design_power", "CPU Thermal Design Power (TDP)", "W", 45, 15)));
+  assert.ok(specProxy(def("cpu_cores", "Core count", "cores", 4, 16)));
+  assert.ok(!specProxy(def("geekbench_6_multi_core", "Geekbench 6 Multi-Core Score", "score", 3000, 12000)));
+  assert.ok(!specProxy(def("weight", "Weight", "grams", 2000, 1200)));
+
+  // 2. Unit mix-ups are refused: 1.24 recorded for a weight in grams.
+  assert.match(implausible(def("weight", "Weight", "grams", 2000, 1200), 1.24) ?? "", /Check the unit/);
+  assert.equal(implausible(def("weight", "Weight", "grams", 2000, 1200), 1240), null);
+
+  const geek = def("geekbench_6_multi_core", "Geekbench 6 Multi-Core", "score", 3000, 12000, { component: "processor", sourceDomain: "geekbench.com" });
+  const weight = def("weight", "Weight", "grams", 2000, 1200);
+  const tdp = def("cpu_thermal_design_power", "TDP", "W", 45, 15);
+  const state: any = {
+    candidates: [
+      { name: "Vivobook", components: { processor: "AMD Ryzen 5 7530U" } },
+      { name: "Inspiron", components: { processor: "Intel Core Ultra 5 125H" } },
+      { name: "Aspire", components: { processor: "Intel Core Ultra 5 125H" } },
+    ],
+    metricPlan: [{ criterion: "performance", keys: ["geekbench_6_multi_core", "cpu_thermal_design_power"] }, { criterion: "portability", keys: ["weight"] }],
+    metricDefs: { geekbench_6_multi_core: geek, weight, cpu_thermal_design_power: tdp },
+    metrics: [
+      // Benchmarks measured for the processors (on geekbench.com: confirmed), recorded while researching two of the laptops.
+      { id: "M1", candidate: "Vivobook", key: "geekbench_6_multi_core", value: 6000, sourceUrl: "https://browser.geekbench.com/a", round: 0, component: "AMD Ryzen 5 7530U" },
+      { id: "M2", candidate: "Inspiron", key: "geekbench_6_multi_core", value: 10200, sourceUrl: "https://browser.geekbench.com/b", round: 0, component: "Intel Core Ultra 5 125H" },
+      { id: "M3", candidate: "Vivobook", key: "cpu_thermal_design_power", value: 15, sourceUrl: "https://x.com", round: 0 },
+      // Weight only for two of three laptops.
+      { id: "M4", candidate: "Inspiron", key: "weight", value: 1240, sourceUrl: "https://a.com", round: 0 },
+      { id: "M5", candidate: "Aspire", key: "weight", value: 1200, sourceUrl: "https://b.com", round: 0 },
+    ],
+  };
+  dropSpecProxies(state);
+  assert.deepEqual(state.metricPlan[0].keys, ["geekbench_6_multi_core"]);
+
+  // 3. The Aspire shares the Inspiron's processor, so it gets that benchmark.
+  const names = ["Vivobook", "Inspiron", "Aspire"];
+  assert.deepEqual(comparableKeys(state, names, "performance"), { keys: ["geekbench_6_multi_core"], leftOut: [] });
+  const aspire = metricScoreFor(state, "Aspire", "performance", ["geekbench_6_multi_core"]);
+  assert.equal(aspire.measured[0].value, 10200);
+  assert.equal(aspire.measured[0].via, "Intel Core Ultra 5 125H");
+  assert.ok(metricScoreFor(state, "Vivobook", "performance", ["geekbench_6_multi_core"]).score! < aspire.score!);
+
+  // 4. Weight is missing for the Vivobook: it's left out for everyone, not used for some.
+  assert.deepEqual(comparableKeys(state, names, "portability"), { keys: [], leftOut: ["Weight"] });
+
+  // 5. A single-source measurement counts half as much.
+  assert.equal(combineScores(10, 5, 1), 8.5); // 0.7 x 10 + 0.3 x 5
+  assert.equal(combineScores(10, 5, 0), 6.8); // 0.35 x 10 + 0.65 x 5
+});

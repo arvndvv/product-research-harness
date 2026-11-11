@@ -72,6 +72,16 @@ npm run app        # builds the UI, then serves it at http://localhost:4321
   must-haves, dealbreakers or nice-to-haves. Weights and budget re-rank instantly in code from
   the evidence already collected; must-have/dealbreaker changes re-check each product with the
   model. Only the report is rewritten; nothing new is searched.
+- **Cost meter and budget per run**: every model call is priced (Profile & settings > Models & search >
+  Cost; built-in Mistral list prices, editable) and the run's cost shows live next to its title, with a
+  breakdown per step. A run pauses at its budget (default $1, `0` = no limit) with everything saved;
+  raise it and resume from the banner. Costs are kept low by: a cheap research model plus a strong judge,
+  showing research only the relevant passages of each page (`PAGE_CHARS`), trimming old tool output
+  from the conversation early, and recording several findings or prices in one call.
+- **Go back a step**: click Discover or Shortlist (↺) in the step bar of any run, even mid-research.
+  Shortlist brings every product found back for review and re-picking, keeping verified findings and
+  prices; Discover searches again from scratch, keeping products you added. The interview and brief
+  are kept either way, and the old recommendation is saved as `report-before-restart-*.md`.
 - **Suggest a product**: on a finished or paused run, add a product you think is worth
   considering (Products tab). It gets the same research, measurements, budget check and
   side-by-side comparison as the others, then the recommendation is updated.
@@ -221,6 +231,18 @@ exploration run an **agent loop** inside. Most real harnesses mix the two like t
     review tone). Final = 70% measurement + 30% comparison (`METRIC_WEIGHT`), or comparison only
     when no measurement exists.
   - Confidence is computed by code from measurement coverage and evidence, not self-reported.
+  - Rules that keep the numbers honest (each learned from a wrong ranking):
+    - only measured outcomes (benchmarks, lab tests, weight), never spec-sheet proxies like TDP, core
+      count or clock speed: "lower power" once ranked the slowest processor first;
+    - recorded values must fit the measurement's scale, which catches unit mix-ups (kg vs grams);
+    - products are only ranked on the same numbers: a measurement missing for any product is left out
+      for all of them (and shown as "Not used");
+    - measurements of a shared part (a processor benchmark) apply to every product with that part;
+    - a single-source measurement counts half until confirmed.
+- **The interview accounts for every factor**: each category has a list of decision factors (for
+  laptops: display, refresh rate, battery, ports...; created once, kept in `knowledge/<category>/factors.json`).
+  Before the brief is accepted, every factor must be asked about, known, part of the criteria, or
+  written as an assumption you can correct when confirming. Nothing is assumed silently.
 - **Accuracy first, so runs agree because they're right** (not because they copy each other):
   - Every finding, measurement and price carries a verbatim quote that code checks against the
     page actually fetched (`verifyQuote` in `src/tools/web.ts`). Paraphrases and invented details fail.
@@ -244,6 +266,23 @@ exploration run an **agent loop** inside. Most real harnesses mix the two like t
   scratch (no earlier evidence) and reports how often the winner and top 3 agree, and how much each
   product's score varies. Use it before and after changing prompts or scoring. It costs N full
   runs; to try it free: `DEMO_MODEL=1 RUNS_DIR=demo-runs KNOWLEDGE_DIR=demo-knowledge npm run stability -- demo-runs/<run>`.
+  Faster, for discovery only: `--stage discover` runs just discovery (minutes, not an hour) and
+  reports which products every run found and **recall**: how many of the products you expect a
+  careful search to find came up. Give the expected list with `--expect "A; B; C"` or a text file
+  (one product per line), or keep it in `knowledge/<category>/expected.txt`.
+- **Discovery that can't stop early** (`src/phases/discover.ts`). The longlist may only finish when code
+  confirms coverage, not just a count:
+  - every angle searched: expert reviews, owner threads, retailer/comparison lists in the price range,
+    and recent launches (each product records which angle found it);
+  - every main brand for the category, region and price range (listed by one model call first) has a
+    product on the list or was ruled out with a reason;
+  - the search saturated: the last `DISCOVER_SATURATION` (3) searches found nothing new (or the list
+    reached `MAX_LONGLIST`, 20).
+  After repeated rejections the agent may finish with an explained gap, which the app shows.
+  Then **you review the longlist** before anything is cut: remove products, add your own (always
+  researched), or ask it to search for more with a hint (up to twice). Set `REVIEW_LONGLIST=0` to skip. The
+  Products tab shows how products were found and which brands were checked, and every cut product
+  has "Compare this too".
 
 ## How the web app is wired
 
@@ -278,9 +317,30 @@ and Resume picks up at the saved phase.
 
 ## Teaching it a new domain
 
-Copy `domains/shoes.md` to `domains/laptops.md` (the filename must appear in the
-category intake produces, e.g. "gaming laptops"). Write what matters, which sources
-to trust, and common pitfalls. No code changes needed.
+Guides ship in `domains/*.md` for:
+
+- **Computing**: laptops, tablets, monitors, GPUs, RAM, SSDs, hard drives, NAS, Wi-Fi routers
+- **Phones and wearables**: smartphones, smartwatches, earbuds, headphones, power banks
+- **Home**: TVs, air conditioners, refrigerators, washing machines, air purifiers
+- **Other**: cameras, shoes
+
+A guide is picked when its filename or one of its `Aliases:` appears in the category the interview
+produces. The last-mentioned thing wins, so "ssd for laptop" uses `ssds.md` and "laptop ram" uses
+`ram.md`; words after "for/with/under" are ignored. Add a guide by copying `domains/laptops.md`,
+or use Profile & settings > Domain guides > "Draft with AI" and correct it. No code changes needed.
+`npm test` checks every guide parses and its scales point the right way. A guide has up to three jobs:
+
+- **`## Decision factors`** (a bullet list): what the interview must account for. Each factor is
+  asked about or shown as an assumption you confirm.
+- **`## Measurements`** (a table: `| key | label | unit | better | poor | good | source | part |`):
+  trusted, measured outcomes with fixed scales. They're added to the category's measurement library
+  (existing keys keep their scale), so every run uses the same benchmarks from the start. `part`
+  marks a shared component (e.g. `processor`) so its benchmark applies to every product with it.
+  Specs like power rating or core count are refused. Only add a row when reviewers publish the
+  same measurement for most products in the category (RTINGS scores, Backblaze failure rates,
+  TechPowerUp power draw). Where nothing like that exists (RAM, NAS, routers, fridges), leave the
+  table out and say so: products are then compared side by side on evidence instead of a score scale.
+- **The rest** (what matters, sources, pitfalls) goes into the discovery, research and judging prompts.
 
 ## Exercises (roughly in order)
 

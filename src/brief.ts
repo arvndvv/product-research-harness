@@ -9,7 +9,7 @@
  * different kind of product or a much bigger budget, start a new research.
  */
 import { applyHardFilters } from "./phases/score.ts";
-import type { BriefEdit, RunState } from "./shared.ts";
+import { PHASE_ORDER, type BriefEdit, type Candidate, type RunState } from "./shared.ts";
 import { findCandidate, newCandidate } from "./state.ts";
 
 const sameList = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
@@ -143,25 +143,98 @@ export function addUserRemark(state: RunState, name: string, rawText: string, ra
   return { name: c.name, start: false };
 }
 
-export function addUserCandidate(state: RunState, rawName: string, note: string): { name: string; start: boolean } | { error: string } {
-  const name = rawName.trim().replace(/\s+/g, " ");
+export type RestartStep = "discover" | "shortlist";
+
+/** Forget everything a product picked up after it was found: scores, research status, verdicts. */
+function resetCandidate(c: Candidate) {
+  c.status = c.cutReason === "Removed by you" ? "cut" : "longlist";
+  if (c.status === "longlist") c.cutReason = undefined;
+  c.researched = false;
+  c.followups = [];
+  c.notes = [];
+  c.scores = undefined;
+  c.total = undefined;
+  c.disqualified = undefined;
+  c.ruleFails = undefined;
+  c.incomplete = undefined;
+  c.bestPrice = undefined;
+  c.toppedUp = undefined;
+  c.dirty = true;
+}
+
+/**
+ * Go back to an earlier step of a run without starting over. The interview and
+ * brief are always kept.
+ *  - "shortlist": keep every product found, put them all back on the list for
+ *    review and re-shortlisting. Verified findings and prices are kept, so
+ *    re-researching a product builds on what's already known.
+ *  - "discover": search for products again from scratch. Only products you
+ *    added are kept (with their findings); everything else is forgotten here
+ *    (researched products are still in the category library and get reused).
+ */
+export function restartFrom(state: RunState, step: RestartStep): { message: string } | { error: string } {
+  if (!state.requirements) return { error: "finish the interview first" };
+  if (!["discover", "shortlist"].includes(step)) return { error: "you can go back to Discover or Shortlist" };
+  if (PHASE_ORDER.indexOf(state.phase) <= PHASE_ORDER.indexOf(step)) return { error: `the run hasn't got past ${step} yet` };
+  state.round = 0;
+  state.critiqueNotes = [];
+  state.rescoreOnly = undefined;
+  state.reportPath = undefined;
+  if (step === "shortlist") {
+    for (const c of state.candidates) resetCandidate(c);
+    state.discovery = { ...(state.discovery ?? { brands: [], brandsRuledOut: [], searches: 0, searchesSinceNew: 0 }), agentDone: true };
+    state.phase = "discover"; // the longlist review comes first, then shortlisting
+    return { message: `Back to the product list: ${state.candidates.filter((c) => c.status === "longlist").length} products to review and shortlist again` };
+  }
+  state.candidates = state.candidates.filter((c) => c.addedByUser);
+  state.candidates.forEach(resetCandidate);
+  const keep = new Set(state.candidates.map((c) => c.name));
+  state.evidence = state.evidence.filter((e) => keep.has(e.candidate));
+  state.prices = (state.prices ?? []).filter((p) => keep.has(p.candidate));
+  state.metrics = (state.metrics ?? []).filter((m) => keep.has(m.candidate));
+  state.discovery = { brands: state.discovery?.brands ?? [], brandsRuledOut: [], searches: 0, searchesSinceNew: 0 };
+  state.phase = "discover";
+  return { message: `Searching for products again${keep.size ? ` (keeping the ${keep.size} you added)` : ""}` };
+}
+
+const URL_RE = /https?:\/\/[^\s<>"]+/g;
+
+/** A pasted product URL as a name: use its last path segment ("apple-macbook-air-m1-..."), readable. */
+function nameFromUrl(url: string): string {
+  try {
+    const seg = new URL(url).pathname.split("/").filter(Boolean).reverse().find((s) => /[a-z]/i.test(s) && s.length > 6) ?? "";
+    return decodeURIComponent(seg).replace(/\.(html?|php|aspx?)$/i, "").replace(/[-_]+/g, " ").trim();
+  } catch {
+    return "";
+  }
+}
+
+export function addUserCandidate(state: RunState, rawName: string, note: string, rawLinks: string[] = []): { name: string; start: boolean } | { error: string } {
+  // Links can come in their own field, in the note, or pasted as the name: all of them must be opened by research.
+  const links = [...new Set([...rawLinks.map((l) => l.trim()), ...(note.match(URL_RE) ?? []), ...(rawName.match(URL_RE) ?? [])].filter((l) => /^https?:\/\//.test(l)))].slice(0, 5);
+  note = note.replace(URL_RE, "").replace(/\s+/g, " ").trim();
+  const pastedUrl = rawName.trim().match(/^https?:\/\/\S+$/);
+  const name = (pastedUrl ? nameFromUrl(rawName.trim()) : rawName.trim()).replace(/\s+/g, " ");
   if (name.length < 2 || name.length > 120) return { error: "give the product's full name, e.g. 'Samsung Galaxy S24 FE'" };
   if (!state.requirements) return { error: "finish the interview first" };
   const why = `Added by you${note.trim() ? `: ${note.trim()}` : ""}`;
   const existing = findCandidate(state, name);
   if (existing && existing.status === "shortlist") return { error: `${existing.name} is already being compared` };
-  if (existing) {
-    existing.status = "shortlist";
-    existing.addedByUser = true;
-    existing.whyConsidered = why;
-    existing.cutReason = undefined;
-    existing.researched = false;
-    existing.dirty = true;
+  let c = existing;
+  if (c) {
+    c.status = "shortlist";
+    c.addedByUser = true;
+    c.whyConsidered = why;
+    c.cutReason = undefined;
+    c.researched = false;
+    c.dirty = true;
   } else {
-    const c = newCandidate({ name, price: "", whyConsidered: why, source: "", status: "shortlist", round: state.round });
+    c = newCandidate({ name, price: "", whyConsidered: why, source: links[0] ?? "", status: "shortlist", round: state.round });
     c.addedByUser = true;
     state.candidates.push(c);
   }
+  // A link the person gave is a must-open source: research can't finish without opening it.
+  if (links.length) (c.userRemarks ??= []).push({ text: note || "Check this link (price, variant, condition)", links, t: new Date().toISOString() });
   if (state.phase === "done") {
     state.phase = "research";
     state.rescoreOnly = true; // research it, score everything, rewrite the report; no new critique rounds

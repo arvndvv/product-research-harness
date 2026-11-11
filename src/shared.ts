@@ -56,6 +56,11 @@ export type MetricDef = {
   sourceHint: string;
   /** The authoritative site (e.g. "dxomark.com"): a value from there counts as confirmed on its own. */
   sourceDomain?: string;
+  /**
+   * A part many products share (e.g. "processor"): a value measured for that
+   * part (e.g. a CPU benchmark) applies to every product that uses it.
+   */
+  component?: string;
 };
 
 export type MetricObservation = {
@@ -68,9 +73,30 @@ export type MetricObservation = {
   round: number;
   cachedFrom?: string;
   quote?: string;
+  /** For component metrics: which part was measured (e.g. "AMD Ryzen 5 7530U"). */
+  component?: string;
 };
 
 /** A price seen for a product. Prices are data, so budget checks run in code. */
+/** The angles discovery must cover before it may finish. */
+export const DISCOVERY_ANGLES = ["expert_review", "community", "retailer_list", "new_launch"] as const;
+export type DiscoveryAngle = (typeof DISCOVERY_ANGLES)[number] | "earlier_research" | "other";
+
+/** How thoroughly discovery searched: shown in the UI and checked by the finish gate. */
+export type DiscoveryStats = {
+  /** Brands that sell this category in the region and price range (one model call before discovery). */
+  brands: string[];
+  /** Brands discovery deliberately left out, with why. */
+  brandsRuledOut: { brand: string; reason: string }[];
+  searches: number;
+  /** Searches since the last new product; high = the search had saturated. */
+  searchesSinceNew: number;
+  /** Gaps the agent couldn't close, explained (accepted only after repeated rejections). */
+  gaps?: string;
+  /** The first discovery pass is done (so Resume goes straight to the review). */
+  agentDone?: boolean;
+};
+
 export type UserRemark = { text: string; links: string[]; t: string; done?: boolean };
 
 /** A recorded price, with code's verdict on whether it counts. */
@@ -103,7 +129,9 @@ export type Score = {
   /** 0-10 from the side-by-side comparison by the judge model */
   judgedScore?: number;
   /** The measurements behind metricScore */
-  measured?: { key: string; label: string; value: number; unit: string; score: number; confirmed?: boolean }[];
+  measured?: { key: string; label: string; value: number; unit: string; score: number; confirmed?: boolean; via?: string }[];
+  /** Planned measurements left out because not every product has them (products are only ranked on the same numbers). */
+  leftOut?: string[];
 };
 
 export type Candidate = {
@@ -131,10 +159,14 @@ export type Candidate = {
   dirty: boolean;
   /** Suggested by the person rather than found by discovery. */
   addedByUser?: boolean;
+  /** Kinds of source discovery found this product through (expert_review, community...). */
+  foundVia?: DiscoveryAngle[];
   /** Remarks and links the person added to this product; open ones are researched next. */
   userRemarks?: UserRemark[];
   /** Already got an extra research pass for being thinly researched. */
   toppedUp?: boolean;
+  /** Parts this product uses, by kind (e.g. {processor: "AMD Ryzen 5 7530U"}), for shared measurements. */
+  components?: Record<string, string>;
 };
 
 export type Phase = "intake" | "discover" | "shortlist" | "research" | "score" | "critique" | "report" | "done";
@@ -164,6 +196,35 @@ export type RunState = {
   /** History of brief edits made after the interview. */
   briefEdits?: { t: string; changes: string[] }[];
   reportPath?: string;
+  discovery?: DiscoveryStats;
+  /** What this run has cost so far (model calls). */
+  cost?: RunCost;
+  /** Pause the run when cost reaches this (USD). 0 = no limit. Absent = the default from Settings. */
+  budgetUsd?: number;
+};
+
+/** USD per 1M tokens. */
+export type ModelPrice = { input: number; cachedInput?: number; output: number };
+
+/**
+ * Published list prices (USD per 1M tokens) as of November 2026. Providers
+ * change these: edit them in Profile > Models & search to match your bill.
+ */
+export const DEFAULT_PRICES: Record<string, ModelPrice> = {
+  "mistral-small-latest": { input: 0.15, cachedInput: 0.015, output: 0.6 },
+  "mistral-medium-latest": { input: 1.5, cachedInput: 0.15, output: 7.5 },
+  "mistral-large-latest": { input: 0.5, cachedInput: 0.05, output: 1.5 },
+};
+
+export type RunCost = {
+  usd: number;
+  calls: number;
+  inputTokens: number;
+  cachedTokens: number;
+  outputTokens: number;
+  byPhase: Partial<Record<Phase, number>>;
+  /** Models used without a known price (their calls count as $0: set a price in Settings). */
+  unpriced?: string[];
 };
 
 // --- Profile (long-term memory about the user) -----------------------------
@@ -191,6 +252,8 @@ export type PendingQuestion = {
   options?: string[];
   /** e.g. "Question 2 of up to 6" */
   progress?: string;
+  /** Longlist review: the products found, to remove from or add to. Answer is JSON (see parseLonglistReview). */
+  longlist?: { name: string; price: string; why: string; foundVia: string[]; source: string; addedByUser?: boolean }[];
 };
 
 export type RunStatus = "running" | "waiting" | "idle" | "error" | "done";
@@ -232,6 +295,10 @@ export type Settings = {
   /** Shortlist, scoring, critique, report. Absent = same as main. */
   judge?: ModelChoice;
   search: { provider: SearchProvider; tavilyKey?: string; exaKey?: string; braveKey?: string; searxngUrl?: string };
+  /** Model prices (USD per 1M tokens) overriding the built-in defaults. */
+  prices?: Record<string, ModelPrice>;
+  /** Budget for each new run in USD (0 = no limit). Default 1. */
+  defaultRunBudgetUsd?: number;
 };
 
 /** What the browser sees: keys are never sent back, only whether one is set and its last 4 characters. */
@@ -240,6 +307,10 @@ export type SettingsView = {
   main?: ModelChoice;
   judge?: ModelChoice;
   search: { provider: SearchProvider; tavilyKeyHint?: string; exaKeyHint?: string; braveKeyHint?: string; searxngUrl?: string };
+  prices: Record<string, ModelPrice>;
+  /** Built-in prices, shown so the person can see and override them. */
+  defaultPrices: Record<string, ModelPrice>;
+  defaultRunBudgetUsd: number;
 };
 
 /** Partial update. For keys: omitted or "" = keep, null = remove, string = set. */
@@ -248,6 +319,9 @@ export type SettingsUpdate = {
   main?: ModelChoice;
   judge?: ModelChoice | null;
   search?: { provider?: SearchProvider; tavilyKey?: string | null; exaKey?: string | null; braveKey?: string | null; searxngUrl?: string };
+  /** Replaces the whole price table (null price = back to the default). */
+  prices?: Record<string, ModelPrice | null>;
+  defaultRunBudgetUsd?: number;
 };
 
 /** Setup help shown in the app: what's free, where to get a key, and the steps. */

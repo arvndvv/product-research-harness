@@ -12,7 +12,14 @@ const UA = "Mozilla/5.0 (compatible; research-harness/0.1; personal research too
 
 export type SearchResult = { title: string; url: string; snippet: string };
 
+let searchImpl: ((query: string, max: number) => Promise<SearchResult[]>) | null = null;
+/** Test/demo hook: replace web search (null restores the real one). */
+export function setSearchImpl(fn: typeof searchImpl) {
+  searchImpl = fn;
+}
+
 export async function search(query: string, max = 8): Promise<SearchResult[]> {
+  if (searchImpl) return searchImpl(query, max);
   const s = searchSettings();
   const timeout = requestSignal(30_000);
 
@@ -212,10 +219,47 @@ async function fetchPage(url: string): Promise<string> {
   return text;
 }
 
-/** Fresh set of web tools with their own fetch budget. */
-export function makeWebTools(maxFetches = config.limits.maxFetchesPerTask): Tool[] {
+/**
+ * The parts of a long page worth showing the model: passages that mention the
+ * product or what it's looking for, kept in page order, plus the page's opening
+ * (title, model name). Sending only these instead of whole pages is the biggest
+ * cost saving in research: every later model call resends earlier tool output.
+ * Quotes are still checked against the FULL page, so nothing is lost for verification.
+ */
+export function focusText(text: string, terms: string[], maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const words = [...new Set(terms.flatMap((t) => t.toLowerCase().split(/[^a-z0-9₹$%.]+/)).filter((w) => w.length >= 3))];
+  if (!words.length) return `${text.slice(0, maxChars)}\n[...truncated]`;
+  // Passages of ~400 chars, split on blank lines / sentence ends.
+  const parts: string[] = [];
+  for (const block of text.split(/\n{2,}|(?<=[.!?])\s+(?=[A-Z])/)) {
+    for (let i = 0; i < block.length; i += 400) parts.push(block.slice(i, i + 400));
+  }
+  const scored = parts.map((p, i) => {
+    const low = p.toLowerCase();
+    const hits = words.reduce((n, w) => n + (low.includes(w) ? 1 : 0), 0);
+    const numbers = /\d/.test(p) ? 0.5 : 0; // measurements and prices are worth keeping
+    return { i, p, score: hits + (hits ? numbers : 0) };
+  });
+  const head = text.slice(0, 300);
+  let budget = maxChars - head.length - 80;
+  const keep = new Set<number>();
+  for (const s of [...scored].filter((s) => s.score > 0).sort((a, b) => b.score - a.score)) {
+    if (s.p.length > budget) continue;
+    keep.add(s.i);
+    budget -= s.p.length + 6;
+  }
+  const picked = scored.filter((s) => keep.has(s.i) && s.p !== head).map((s) => s.p.trim());
+  return `${head}\n[...]\n${picked.join("\n[...]\n")}\n[showing the ${picked.length} most relevant passages of a ${text.length}-character page; call fetch_page again with a different looking_for to see other parts]`;
+}
+
+/**
+ * Fresh set of web tools with their own fetch budget. With focus terms (the
+ * product name, the criteria), long pages are cut down to the relevant passages.
+ */
+export function makeWebTools(maxFetches = config.limits.maxFetchesPerTask, opts: { focus?: string[]; maxChars?: number } = {}): Tool[] {
   let fetches = 0;
-  const maxChars = config.limits.pageChars;
+  const maxChars = opts.maxChars ?? config.limits.pageChars;
 
   const webSearch = tool(
     "web_search",
@@ -233,19 +277,27 @@ export function makeWebTools(maxFetches = config.limits.maxFetchesPerTask): Tool
 
   const fetchPageTool = tool(
     "fetch_page",
-    "Open a URL and read its text. Reddit thread URLs return the post plus top-voted comments.",
-    { url: { type: "string" } },
-    async ({ url }) => {
-      if (fetches >= maxFetches) {
+    opts.focus
+      ? "Open a URL and read the parts relevant to what you're looking for (long pages are cut to the most relevant passages). Reddit thread URLs return the post plus top-voted comments."
+      : "Open a URL and read its text. Reddit thread URLs return the post plus top-voted comments.",
+    opts.focus
+      ? { url: { type: "string" }, looking_for: { type: "string", description: "What you want from this page, e.g. 'battery life hours, price'. Shapes which passages you see." } }
+      : { url: { type: "string" } },
+    async ({ url, looking_for }) => {
+      // Re-reading a page already fetched (e.g. for other passages) is free.
+      const cached = pageCache.has(urlKey(String(url)));
+      if (!cached && fetches >= maxFetches) {
         return `ERROR: page budget for this task is used up (${maxFetches} pages). Record what you have and finish.`;
       }
-      fetches++;
+      if (!cached) fetches++;
       const text = await fetchPage(String(url));
       const left = `[page ${fetches}/${maxFetches} of budget used]`;
+      if (opts.focus) return `${focusText(text, [...opts.focus, String(looking_for ?? "")], maxChars)}\n${left}`;
       return text.length > maxChars
         ? `${text.slice(0, maxChars)}\n[...truncated, ${text.length - maxChars} more chars] ${left}`
         : `${text}\n${left}`;
     },
+    ["url"],
   );
 
   return [webSearch, fetchPageTool];

@@ -19,13 +19,16 @@
 import { config } from "../config.ts";
 import { ask, log } from "../context.ts";
 import { requirementsBlock } from "../format.ts";
-import { addProfileFacts, profileText } from "../knowledge.ts";
+import { addProfileFacts, domainFactors, profileText } from "../knowledge.ts";
+import { loadFactors, saveFactors } from "../library.ts";
 import { chatJSON } from "../llm.ts";
 import { saveState, type Requirements, type RunState } from "../state.ts";
 
 type Known = { topic: string; value: string; source: "said" | "implied" | "profile" };
 type NextQuestion = { question: string; why_it_matters: string; resolves: string; suggested_answer?: string; options?: string[] };
 type IntakeTurn = {
+  /** The product type, as soon as it's clear (used to load the category's decision factors). */
+  category?: string;
   known: Known[];
   next_question: NextQuestion | null;
   requirements: Record<string, unknown> | null;
@@ -108,7 +111,30 @@ const HEDGE = /\b(likely|probably|maybe|might|perhaps|seems?|assum\w*|guess\w*|p
  * Check one interview turn. Returns a problem for the model to fix, or null.
  * Exported for tests: this is where the "don't ask redundant questions" rule lives.
  */
-export function checkTurn(turn: IntakeTurn, qa: QA[], remaining: number): string | null {
+/**
+ * Decision factors nobody accounted for: not known, not asked, not in the brief
+ * and not listed as an assumption. Each one must be visible to the person, so
+ * nothing (display, refresh rate, battery...) is silently assumed.
+ */
+const stringValues = (v: unknown): string[] =>
+  typeof v === "string" ? [v] : Array.isArray(v) ? v.flatMap(stringValues) : v && typeof v === "object" ? Object.values(v).flatMap(stringValues) : [];
+
+export function unaccountedFactors(factors: string[], turn: IntakeTurn, qa: QA[]): string[] {
+  const text = norm(
+    [
+      ...turn.known.map((k) => `${k.topic} ${k.value}`),
+      ...qa.map((x) => `${x.question} ${x.resolves ?? ""} ${x.answer}`),
+      ...stringValues(turn.requirements), // values only: a JSON key like "weight" isn't the weight factor
+    ].join(" "),
+  );
+  const has = (w: string) => new RegExp(`\\b${w}`).test(text);
+  return factors.filter((f) => {
+    const ws = norm(f).split(" ").filter((w) => w.length >= 3 && !["quality", "life", "the", "and"].includes(w));
+    return ws.length > 0 && !ws.some(has);
+  });
+}
+
+export function checkTurn(turn: IntakeTurn, qa: QA[], remaining: number, factors: string[] = []): string | null {
   if (!Array.isArray(turn?.known)) return 'missing "known" array';
   const q = turn.next_question;
   if (q && remaining > 0) {
@@ -129,7 +155,39 @@ export function checkTurn(turn: IntakeTurn, qa: QA[], remaining: number): string
   if (pending.length && remaining > 0) {
     return `profile facts are suggestions, not answers. Before finishing, confirm: ${pending.map((k) => `"${k.topic}: ${k.value}"`).join(", ")}. Ask about them (you may combine them in one question; set "resolves" to the topic names) with the saved value as suggested_answer.`;
   }
+  const open = unaccountedFactors(factors, turn, qa);
+  if (open.length) {
+    return `these decision factors aren't accounted for: ${open.join(", ")}. For each, either ask about it (if it could change which product fits and you have questions left), or add an assumption to "assumptions" in the person's terms (e.g. "Display: a standard full-HD screen is fine"), so they can correct it when confirming`;
+  }
   return validateRequirements(toRequirements(turn.requirements));
+}
+
+type FactorsJSON = { factors: string[] };
+
+/** The factors buyers weigh for this category, created once and kept in the category library. */
+async function categoryFactors(category: string): Promise<string[]> {
+  // A human-written domain guide wins over a model-made list.
+  const fromGuide = domainFactors(category);
+  if (fromGuide.length) return fromGuide;
+  const saved = loadFactors(category);
+  if (saved.length) return saved;
+  try {
+    const r = await chatJSON<FactorsJSON>(
+      [
+        {
+          role: "system",
+          content: `List the decision factors a careful buyer weighs when choosing ${category}: the things that differ between products and that some buyers care about (for laptops, e.g.: processor performance, RAM, storage, display quality, refresh rate, battery life, weight, keyboard, ports, build quality, operating system). 6-12 factors, each 1-3 words, no price. Reply in JSON: {"factors":["..."]}`,
+        },
+      ],
+      { profile: "judge", label: "Listing decision factors", validate: (v) => (Array.isArray(v?.factors) && v.factors.length >= 3 ? null : 'need a "factors" array of 6-12 items') },
+    );
+    const factors = [...new Set(r.factors.map((f) => String(f).trim()).filter((f) => f.length >= 2 && !/price|budget|cost/i.test(f)))].slice(0, 12);
+    saveFactors(category, factors);
+    return factors;
+  } catch (e) {
+    log(`Couldn't list decision factors (${(e as Error).message}); the interview continues without the checklist`, "warn");
+    return [];
+  }
 }
 
 function systemPrompt(maxQuestions: number) {
@@ -137,6 +195,7 @@ function systemPrompt(maxQuestions: number) {
 
 Reply every turn with a JSON object:
 {
+  "category": "the product type, as soon as it's clear (e.g. laptop, running shoes)",
   "known": [{"topic": "short topic", "value": "...", "source": "said" | "implied" | "profile"}],
   "next_question": {"question": "...", "why_it_matters": "how the answer changes which products fit", "resolves": "the topic it fills", "suggested_answer": "optional", "options": ["optional", "..."]} or null,
   "requirements": null or { ...see below... },
@@ -149,8 +208,9 @@ Deciding what to ask:
 2. Profile facts are SUGGESTIONS, not answers: preferences change. Country and currency can be used directly. Every other relevant profile fact must be confirmed by a question, with the saved value as suggested_answer (e.g. "Still prefer Android?" suggested "Android"). Related ones can be combined in one question; put all their topics in "resolves", comma-separated, using the same topic names as in "known".
 3. Only ask if the answer would change which products are considered or how they're ranked. Worth asking: budget if missing, country if unknown, hard constraints (size, OS/ecosystem, compatibility, space), what they disliked about a previous product, how they'd trade off two priorities that pull against each other. Not worth asking: frequency or intensity when the use is already clear, confirming what they already said, generic checklists, anything whose answer wouldn't change the shortlist.
 4. Ask the most decision-relevant question first. Combine closely related points into one question when natural.
-5. Give 2-5 short options when answers are typical. Fill suggested_answer when the profile or earlier answers make one likely.
-6. You may ask at most ${maxQuestions} questions in total. When nothing decision-relevant is unknown, or no questions are left, set next_question to null and return requirements. Reasonable assumptions are fine: list them in "assumptions"; the person confirms the summary and can correct them.
+5. Give 2-5 short options when answers are typical. The person can pick several, so make options that can combine (e.g. uses: "gym", "commute", "calls") rather than overlapping ranges; their reply then lists them separated by commas. Fill suggested_answer when the profile or earlier answers make one likely.
+6. If a list of decision factors for the category is given, account for EVERY one before finishing: known, asked, part of the criteria/must-haves, or written as an assumption the person can correct (e.g. "Display: standard full-HD is fine", "Refresh rate: 60 Hz is fine"). Don't assume silently. Ask about the ones most likely to change the choice; assume the rest.
+7. You may ask at most ${maxQuestions} questions in total. When nothing decision-relevant is unknown, or no questions are left, set next_question to null and return requirements. Reasonable assumptions are fine: list them in "assumptions"; the person confirms the summary and can correct them.
 
 requirements:
 {"category": "product type in a few words", "summary": "2-3 sentences: the person and the need", "use_case": "concrete situations",
@@ -159,12 +219,13 @@ requirements:
  "must_haves": [], "nice_to_haves": [], "dealbreakers": [],
  "criteria": [{"name": "short", "weight": integer, "description": "what good means FOR THIS PERSON"}] (4-8 criteria, weights sum to 100, reflecting their priorities),
  "assumptions": ["things you assumed without asking"]}
+Criteria are qualities products differ on BY DEGREE (performance, weight, battery life, cooling). A yes/no requirement ("macOS or Windows", "backlit keyboard") is a must-have, not a criterion: as a criterion it would reward one acceptable option over another the person accepts equally.
 Must-haves and dealbreakers: only hard requirements the person stated. Price is handled by the budget; don't add it as a must-have or criterion.
 
 profile_updates: durable facts worth remembering for FUTURE purchases, only things the person said or confirmed, never guesses. Each {"fact": "topic: value", "scope": ""} where scope is "" for facts that apply to everything (country, currency, general taste) or the product area for product-specific preferences, e.g. {"fact": "OS: Android", "scope": "smartphones"}. Skip facts already in the profile unless they changed.`;
 }
 
-function turnMessage(state: RunState, qa: QA[], remaining: number) {
+function turnMessage(state: RunState, qa: QA[], remaining: number, factors: string[] = []) {
   const profile = profileText();
   const history = qa.length
     ? qa.map((x, i) => (x.correction ? `Correction to the summary: "${x.answer}"` : `Q${i + 1}${x.resolves ? ` (about: ${x.resolves})` : ""}: ${x.question}\nA: ${x.answer}`)).join("\n\n")
@@ -177,13 +238,17 @@ ${profile || "(empty)"}
 Interview so far:
 ${history}
 
-Questions left: ${remaining}`;
+Questions left: ${remaining}${factors.length ? `
+
+Decision factors for this category (account for each one): ${factors.join(", ")}` : ""}`;
 }
 
 export async function intakePhase(state: RunState) {
   const max = config.limits.intakeQuestions;
   const qa: QA[] = [];
   let corrections = 0;
+  let factors: string[] = [];
+  let factorsFor = "";
 
   for (let turnNo = 0; turnNo < max + 12; turnNo++) {
     const asked = qa.filter((x) => !x.correction).length;
@@ -193,10 +258,20 @@ export async function intakePhase(state: RunState) {
     const turn = await chatJSON<IntakeTurn>(
       [
         { role: "system", content: systemPrompt(max) },
-        { role: "user", content: turnMessage(state, qa, remaining) },
+        { role: "user", content: turnMessage(state, qa, remaining, factors) },
       ],
-      { validate: (t) => checkTurn(t, qa, remaining), temperature: 0.2, label: "Interview" },
+      { validate: (t) => checkTurn(t, qa, remaining, factors), temperature: 0.2, label: "Interview" },
     );
+
+    // Once the category is known, load its decision factors (display, battery, ports...).
+    // A turn that tried to finish without them is redone with the checklist.
+    const category = String(turn.category ?? (turn.requirements as any)?.category ?? "").trim();
+    if (category && !factorsFor) {
+      factorsFor = category;
+      factors = await categoryFactors(category);
+      if (factors.length) log(`[interview] factors to account for: ${factors.join(", ")}`, "dim");
+      if (factors.length && !turn.next_question && unaccountedFactors(factors, turn, qa).length) continue;
+    }
 
     const q = turn.next_question;
     if (q && remaining > 0) {

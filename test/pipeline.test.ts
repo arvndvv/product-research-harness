@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { config } from "../src/config.ts";
 import { loadMetricLibrary } from "../src/library.ts";
-import { rememberPage } from "../src/tools/web.ts";
+import { rememberPage, setSearchImpl } from "../src/tools/web.ts";
 
 // Pages the fake researcher "read": quotes are checked against these.
 const SENTENCE = "Testers found the grip and cushioning hold up well over months of daily running.";
@@ -42,15 +42,20 @@ function fakeModel(req: ChatRequest): AssistantMessage {
   const tools = req.tools?.map((t) => t.function.name) ?? [];
 
   // Judgement phases must use the judge model profile; agent loops use main.
-  const judgement = ["pick which products", "You define OBJECTIVE", "compare products on ONE criterion", "check ONE product against", "skeptical senior reviewer", "final recommendation"].some((k) =>
+  const judgement = ["List the brands", "pick which products", "You define OBJECTIVE", "compare products on ONE criterion", "check ONE product against", "skeptical senior reviewer", "final recommendation"].some((k) =>
     system.includes(k),
   );
   assert.equal(req.profile ?? "main", judgement ? "judge" : "main", `wrong model profile for: ${system.slice(0, 60)}`);
 
+  if (system.includes("List the brands")) return json({ brands: ["Shoe", "Ghost"] });
   if (tools.includes("add_candidate")) {
     const step = stepOf(req);
-    if (step < 6) return call("add_candidate", { name: `Shoe ${"ABCDEF"[step]}`, approx_price: "8000 INR", why: "fits", source_url: `https://site${step % 3}.com/x` });
-    return call("finish_longlist", { notes: "ok" });
+    const angles = ["expert_review", "community", "retailer_list", "new_launch"];
+    if (step < 6) return call("add_candidate", { name: `Shoe ${"ABCDEF"[step]}`, approx_price: "8000 INR", why: "fits", source_url: `https://site${step % 3}.com/x`, found_via: angles[step % 4] });
+    // First finish attempt is rejected: search hasn't saturated and brand "Ghost" is unaccounted for.
+    if (step === 6) return call("finish_longlist", {});
+    if (step < 10) return call("web_search", { query: `more options ${step}` });
+    return call("finish_longlist", { brands_ruled_out: [{ brand: "Ghost", reason: "nothing sold in India under the budget" }] });
   }
   if (tools.includes("record_evidence")) {
     const step = stepOf(req);
@@ -102,7 +107,10 @@ function fakeModel(req: ChatRequest): AssistantMessage {
     const items = [...user.matchAll(/^### (P\d+): (.+)$/gm)].map((m) => ({ id: m[1], name: m[2] }));
     const base: Record<string, number> = { "Shoe A": 9.5, "Shoe B": 7, "Shoe C": 9.8, "Shoe Z": 9 };
     // Names deliberately "corrected" by the model: matching must go by id.
-    return json({ scores: items.map((p) => ({ id: p.id, product: `${p.name} (edited)`, score: base[p.name] ?? 5, rationale: "compared E1" })) });
+    // Cite a finding from each product's own block (extreme scores must be backed by evidence).
+    const blocks = user.split(/^### /m).slice(1);
+    const cite = (id: string) => blocks.find((b) => b.startsWith(`${id}:`))?.match(/\bE\d+\b/)?.[0] ?? "";
+    return json({ scores: items.map((p) => ({ id: p.id, product: `${p.name} (edited)`, score: cite(p.id) ? (base[p.name] ?? 5) : Math.min(8, base[p.name] ?? 5), rationale: `compared ${cite(p.id)}` })) });
   }
   if (system.includes("skeptical senior reviewer")) {
     critiques++;
@@ -131,6 +139,8 @@ test("full pipeline iterates once and recommends the best-scoring product", asyn
   config.paths.runs = mkdtempSync(join(tmpdir(), "harness-test-"));
   config.paths.knowledge = mkdtempSync(join(tmpdir(), "harness-knowledge-"));
   setChatImpl(async (req) => fakeModel(req));
+  config.limits.reviewLonglist = false; // covered by its own test
+  setSearchImpl(async (q) => [{ title: "Nothing new", url: `https://search.example/${encodeURIComponent(q)}`, snippet: "same products again" }]);
 
   const state: RunState = createRun("test shoes");
   state.requirements = {
@@ -161,9 +171,16 @@ test("full pipeline iterates once and recommends the best-scoring product", asyn
     }
   } finally {
     console.log = log;
+    setSearchImpl(null);
   }
 
   assert.deepEqual(visited, ["discover", "shortlist", "research", "score", "critique", "research", "score", "critique", "report"]);
+  // Discovery couldn't finish until every angle was covered, the brand checklist was
+  // accounted for, and three searches in a row found nothing new.
+  assert.deepEqual(state.discovery?.brands, ["Shoe", "Ghost"]);
+  assert.deepEqual(state.discovery?.brandsRuledOut.map((b) => b.brand), ["Ghost"]);
+  assert.equal(state.discovery?.searchesSinceNew, 3);
+  assert.equal(state.discovery?.gaps, undefined);
   assert.equal(state.round, 1);
   // Critic's over-budget suggestion was skipped; Shoe Z was added.
   assert.ok(!state.candidates.some((c) => c.name === "Shoe Luxe"));

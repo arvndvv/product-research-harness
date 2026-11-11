@@ -3,8 +3,9 @@
  * DEMO_MODEL=1). It returns the tool calls and JSON a real model would, with
  * no API calls. A good read to see exactly what the harness expects.
  */
+import { chargeUsage, checkBudget } from "../src/context.ts";
 import { setChatImpl, type AssistantMessage, type ChatRequest } from "../src/llm.ts";
-import { rememberPage } from "../src/tools/web.ts";
+import { rememberPage, setSearchImpl } from "../src/tools/web.ts";
 
 const DELAY_MS = Number(process.env.DEMO_DELAY_MS ?? 350);
 let n = 0;
@@ -87,12 +88,25 @@ function fakeModel(req: ChatRequest): AssistantMessage {
     });
   }
 
+  if (String(req.messages[0].content).includes("List the brands")) {
+    return { role: "assistant", content: JSON.stringify({ brands: [...PRODUCTS.map((p) => p.split(" ")[0]), "Luxora"] }) };
+  }
+
   if (tools.includes("add_candidate")) {
+    const angles = ["community", "expert_review", "new_launch", "retailer_list"];
     if (step < PRODUCTS.length) {
       const name = PRODUCTS[step];
-      return call("add_candidate", { name, approx_price: `₹${(2500 + step * 450).toLocaleString("en-IN")}`, why: "Recommended for mixed turf and road use", source_url: `${SITES[step % 4]}/${step}` });
+      return call("add_candidate", {
+        name,
+        approx_price: `₹${(2500 + step * 450).toLocaleString("en-IN")}`,
+        why: "Recommended for mixed turf and road use",
+        source_url: `${SITES[step % 4]}/${step}`,
+        found_via: angles[step % 4],
+      });
     }
-    return call("finish_longlist", { notes: "done" });
+    // Keep searching until three searches in a row find nothing new, then finish.
+    if (step < PRODUCTS.length + 3) return call("web_search", { query: `turf shoes alternatives ${step}` });
+    return call("finish_longlist", { brands_ruled_out: [{ brand: "Luxora", reason: "only sells premium models far above the budget" }] });
   }
 
   if (tools.includes("record_evidence")) {
@@ -131,7 +145,9 @@ function fakeModel(req: ChatRequest): AssistantMessage {
   }
 
   if (system.includes("pick which products")) {
-    return json({ shortlist: PRODUCTS.slice(0, 4).map((name) => ({ name, reason: "fits the brief" })), cut: PRODUCTS.slice(4).map((name) => ({ name, reason: "near-duplicate of a shortlisted pair" })) });
+    // Pick from the list actually offered (the person may have removed or added products).
+    const offered = [...String(req.messages[1].content).matchAll(/^- (.+?) \| price/gm)].map((m) => m[1]);
+    return json({ shortlist: offered.slice(0, 4).map((name) => ({ name, reason: "fits the brief" })), cut: offered.slice(4).map((name) => ({ name, reason: "near-duplicate of a shortlisted pair" })) });
   }
 
   if (system.includes("You define OBJECTIVE")) {
@@ -158,7 +174,13 @@ function fakeModel(req: ChatRequest): AssistantMessage {
     const crit = system.match(/Criterion: ([^.]+)\./)?.[1] ?? "";
     const base: Record<string, number> = { "Trailblazer Grip 3": 8, "CityStride Comfort": 7, "Courtline All-Rounder": 6, "AeroWalk Mesh 2": 5 };
     return json({
-      scores: names.map((n) => ({ product: n, score: Math.min(10, (base[n] ?? 6) + (crit === "breathability" ? 1 : 0)), rationale: `Compared side by side on ${crit} (demo) E1.` })),
+      // Cite a finding from each product's own block, as the real judge must.
+      scores: names.map((n) => {
+        const block = user.split(/^### /m).find((b) => b.includes(`: ${n}\n`)) ?? "";
+        const id = block.match(/\bE\d+\b/)?.[0];
+        const score = Math.min(id ? 10 : 8, (base[n] ?? 6) + (crit === "breathability" ? 1 : 0));
+        return { product: n, score, rationale: `Compared side by side on ${crit} (demo)${id ? ` ${id}` : ""}.` };
+      }),
     });
   }
 
@@ -182,8 +204,18 @@ function fakeModel(req: ChatRequest): AssistantMessage {
 }
 
 export function installDemoModel() {
+  setSearchImpl(async (q) => [{ title: `Results for ${q} (demo)`, url: "https://search.example/demo", snippet: "The same products as before." }]);
   setChatImpl(async (req) => {
+    checkBudget();
     await new Promise((r) => setTimeout(r, DELAY_MS));
-    return fakeModel(req);
+    const reply = fakeModel(req);
+    // Pretend usage, priced like Mistral Small/Large, so the cost meter and budget work in the demo.
+    const prompt = Math.round(JSON.stringify(req.messages).length / 4);
+    chargeUsage({
+      model: req.profile === "judge" ? "mistral-large-latest" : "mistral-small-latest",
+      baseUrl: "https://demo.example",
+      usage: { prompt_tokens: prompt, completion_tokens: 150, prompt_tokens_details: { cached_tokens: Math.round(prompt * 0.6) } },
+    });
+    return reply;
   });
 }

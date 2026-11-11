@@ -12,12 +12,53 @@
 import { config } from "./config.ts";
 import { log } from "./context.ts";
 import { requirementsBlock } from "./format.ts";
-import { loadMetricLibrary, mergeMetricLibrary } from "./library.ts";
+import { domainMetrics } from "./knowledge.ts";
+import { loadMetricLibrary, mergeMetricLibrary, setMetricComponent } from "./library.ts";
 import { chatJSON } from "./llm.ts";
 import type { MetricDef, RunState } from "./shared.ts";
 
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 const round1 = (x: number) => Math.round(x * 10) / 10;
+
+/**
+ * Specifications are not measurements of quality. Power draw (TDP), core count
+ * or clock speed don't say how fast a laptop is, and treating "lower TDP" as
+ * "better performance" once ranked the slowest processor first. Measurements
+ * must be measured outcomes: benchmarks, lab tests, timed results, weight.
+ */
+const SPEC_PROXY = /\b(tdp|thermal design power|core count|cores|threads|clock speed|base clock|boost clock|ghz|mhz|cache size|megapixels?|mp count)\b/i;
+export function specProxy(def: Pick<MetricDef, "key" | "label" | "unit">): boolean {
+  return SPEC_PROXY.test(`${def.key.replace(/_/g, " ")} ${def.label} ${def.unit}`);
+}
+
+/** Remove spec-sheet proxies from a run's measurement plan (older runs and libraries may have them). */
+export function dropSpecProxies(state: RunState) {
+  const dropped: string[] = [];
+  for (const p of state.metricPlan ?? []) {
+    p.keys = p.keys.filter((k) => {
+      const d = state.metricDefs?.[k];
+      if (d && specProxy(d)) {
+        dropped.push(d.label);
+        return false;
+      }
+      return true;
+    });
+  }
+  if (dropped.length) log(`Not used as measurements (specifications, not measured results): ${[...new Set(dropped)].join(", ")}`, "warn");
+}
+
+/**
+ * Is a recorded value plausible on this measurement's scale? Catches unit mix-ups
+ * (1.24 recorded for a weight measured in grams) before they distort scores.
+ */
+export function implausible(def: MetricDef, value: number): string | null {
+  const lo = Math.min(def.poor, def.good);
+  const hi = Math.max(def.poor, def.good);
+  if (lo > 0 && (value < lo / 10 || value > hi * 10)) {
+    return `${value} is far outside the scale for ${def.label} (weak ${def.poor}, excellent ${def.good} ${def.unit}). Check the unit and convert it to ${def.unit} (e.g. kg to grams), or check you have the right number.`;
+  }
+  return null;
+}
 
 /** Map a measured value onto 0-10 using the metric's fixed scale. */
 export function scaleMetric(def: MetricDef, value: number): number {
@@ -42,6 +83,8 @@ const domain = (url: string) => {
 
 export type MetricStatus = {
   value?: number;
+  /** Set when the value comes from another product with the same part (e.g. "AMD Ryzen 5 7530U"). */
+  via?: string;
   /** From the authoritative site, or two independent sites agreeing. */
   confirmed: boolean;
   /** Independent sources disagree: research must find the authoritative value. */
@@ -56,9 +99,23 @@ export type MetricStatus = {
  *  - different sites disagreeing is a conflict, not something to average away
  */
 export function metricStatus(state: RunState, candidate: string, key: string): MetricStatus {
-  const obs = (state.metrics ?? []).filter((m) => m.key === key && norm(m.candidate) === norm(candidate));
-  if (!obs.length) return { confirmed: false, sources: 0 };
   const def = state.metricDefs?.[key];
+  let obs = (state.metrics ?? []).filter((m) => m.key === key && norm(m.candidate) === norm(candidate));
+  let via: string | undefined;
+  // A part shared with other products (same processor): use what was measured for that part.
+  if (!obs.length && def?.component) {
+    const part = state.candidates.find((c) => norm(c.name) === norm(candidate))?.components?.[def.component];
+    if (part) {
+      obs = (state.metrics ?? []).filter((m) => m.key === key && m.component && norm(m.component) === norm(part));
+      via = part;
+    }
+  }
+  if (!obs.length) return { confirmed: false, sources: 0 };
+  const status = statusOf(state, def, obs);
+  return via ? { ...status, via } : status;
+}
+
+function statusOf(state: RunState, def: MetricDef | undefined, obs: NonNullable<RunState["metrics"]>): MetricStatus {
   const sites = new Set(obs.map((o) => domain(o.sourceUrl)));
   const authority = def?.sourceDomain?.replace(/^www\./, "").toLowerCase();
   const fromAuthority = authority ? obs.filter((o) => domain(o.sourceUrl).toLowerCase().endsWith(authority)) : [];
@@ -86,19 +143,41 @@ function plannedKeys(state: RunState, criterion: string): string[] {
   return state.metricPlan?.find((p) => p.criterion === criterion)?.keys ?? [];
 }
 
+/**
+ * Measurements every product in a comparison has. Products are only ranked on
+ * the SAME numbers: if one laptop has a benchmark and another only has its
+ * weight, comparing those would be meaningless, so a measurement missing for
+ * any product is left out for all of them (they're compared side by side instead).
+ */
+export function comparableKeys(state: RunState, products: string[], criterion: string): { keys: string[]; leftOut: string[] } {
+  const keys: string[] = [];
+  const leftOut: string[] = [];
+  for (const key of plannedKeys(state, criterion)) {
+    const def = state.metricDefs?.[key];
+    if (!def || specProxy(def)) continue;
+    if (products.every((p) => metricStatus(state, p, key).value !== undefined)) keys.push(key);
+    else if (products.some((p) => metricStatus(state, p, key).value !== undefined)) leftOut.push(def.label);
+  }
+  return { keys, leftOut };
+}
+
 /** Code-computed score for one criterion from measurements, plus what it's based on. */
-export function metricScoreFor(state: RunState, candidate: string, criterion: string) {
-  const keys = plannedKeys(state, criterion);
-  const measured: { key: string; label: string; value: number; unit: string; score: number; confirmed: boolean }[] = [];
+export function metricScoreFor(state: RunState, candidate: string, criterion: string, onlyKeys?: string[]) {
+  const keys = (onlyKeys ?? plannedKeys(state, criterion)).filter((k) => {
+    const d = state.metricDefs?.[k];
+    return d && !specProxy(d);
+  });
+  const measured: { key: string; label: string; value: number; unit: string; score: number; confirmed: boolean; via?: string }[] = [];
   for (const key of keys) {
     const def = state.metricDefs?.[key];
     const st = metricStatus(state, candidate, key);
-    if (def && st.value !== undefined) measured.push({ key, label: def.label, value: st.value, unit: def.unit, score: scaleMetric(def, st.value), confirmed: st.confirmed });
+    if (def && st.value !== undefined)
+      measured.push({ key, label: def.label, value: st.value, unit: def.unit, score: scaleMetric(def, st.value), confirmed: st.confirmed, ...(st.via ? { via: st.via } : {}) });
   }
   const score = measured.length ? round1(measured.reduce((s, m) => s + m.score, 0) / measured.length) : undefined;
   // Confidence counts only confirmed measurements.
   const confirmed = measured.filter((m) => m.confirmed).length;
-  return { score, measured, planned: keys.length, coverage: keys.length ? confirmed / keys.length : 0 };
+  return { score, measured, planned: keys.length, coverage: keys.length ? confirmed / keys.length : 0, confirmedShare: measured.length ? confirmed / measured.length : 0 };
 }
 
 // --- Planning ------------------------------------------------------------------------------
@@ -106,7 +185,7 @@ export function metricScoreFor(state: RunState, candidate: string, criterion: st
 type PlanJSON = {
   criteria: {
     criterion: string;
-    metrics: { key: string; label: string; unit: string; higher_is_better: boolean; poor: number; good: number; source_hint: string; source_domain?: string }[];
+    metrics: { key: string; label: string; unit: string; higher_is_better: boolean; poor: number; good: number; source_hint: string; source_domain?: string; component?: string }[];
   }[];
 };
 
@@ -116,10 +195,15 @@ type PlanJSON = {
  */
 export async function planMetrics(state: RunState) {
   const req = state.requirements!;
-  const library = loadMetricLibrary(req.category);
+  // Measurements from the domain guide join the library (existing keys keep their scale),
+  // so the planner reuses trusted benchmarks instead of inventing new ones.
+  const fromGuide = domainMetrics(req.category).filter((d) => !specProxy(d));
+  if (fromGuide.length) mergeMetricLibrary(req.category, fromGuide);
+  // Spec-sheet proxies saved by earlier versions are never offered again.
+  const library = Object.fromEntries(Object.entries(loadMetricLibrary(req.category)).filter(([, d]) => !specProxy(d)));
   const libText = Object.values(library).length
     ? Object.values(library)
-        .map((d) => `- ${d.key}: ${d.label} (${d.unit}, ${d.higherIsBetter ? "higher" : "lower"} is better, poor=${d.poor}, good=${d.good}; source: ${d.sourceHint})`)
+        .map((d) => `- ${d.key}: ${d.label} (${d.unit}, ${d.higherIsBetter ? "higher" : "lower"} is better, poor=${d.poor}, good=${d.good}; source: ${d.sourceHint}${d.component ? `; part: ${d.component}` : ""})`)
         .join("\n")
     : "(none yet: this is the first research in this category)";
 
@@ -132,19 +216,22 @@ export async function planMetrics(state: RunState) {
 Person and requirements:
 ${requirementsBlock(req, { rules: false })}
 
-Existing measurements for this category (reuse these exact keys when a criterion needs the same thing; never redefine them):
+Existing measurements for this category (reuse these exact keys when a criterion needs the same thing; never redefine them. They come from the domain guide and earlier runs, so prefer them over new ones):
 ${libText}
 
 For each scoring criterion, choose 0-3 metrics that:
 - are published as NUMBERS by reputable testers or spec sheets for most products in this category (lab test scores, benchmarks, measured hours/minutes, weight in grams, brightness in nits, charging time...),
 - are measured the same way for every product, ideally by ONE named source (e.g. "DXOMARK camera score", "GSMArena active use score in hours", "Geekbench 6 multi-core"); give that source's website as source_domain (e.g. "dxomark.com") when there is one,
-- actually reflect what "good" means for this person on that criterion.
+- actually reflect what "good" means for this person on that criterion,
+- are MEASURED OUTCOMES, not specifications used as proxies. A benchmark score, a lab test, measured battery hours or a measured temperature are outcomes. TDP / power rating, core count, clock speed (GHz), cache or megapixels are specs: they don't say how well a product performs (a lower-power chip is not a faster one), so never use them. Physical facts that ARE the outcome (weight in grams for portability, screen brightness in nits) are fine.
+If a metric measures a part many products share (e.g. a processor benchmark like Geekbench 6 multi-core), set "component" to that part (e.g. "processor"): then every product with the same processor gets the same measured value, even when no review of that exact product has it.
+Units: say exactly which unit values must be in (e.g. "grams", not "kg"), and give poor/good in that unit.
 Use an empty list when a criterion is subjective (design, feel) or no comparable numbers exist; it will be judged side by side instead.
 For NEW metrics give a fixed scale for THIS category today: "poor" = value of a weak product, "good" = value of an excellent product. (If lower is better, poor > good.)
 Keys: lowercase snake_case, specific (e.g. "dxomark_camera", not "camera").
 
-JSON: {"criteria":[{"criterion":"<exact criterion name>","metrics":[{"key":"...","label":"...","unit":"...","higher_is_better":true,"poor":0,"good":0,"source_hint":"...","source_domain":"..."}]}]}
-For an existing key, just repeat the key; other fields are ignored.`,
+JSON: {"criteria":[{"criterion":"<exact criterion name>","metrics":[{"key":"...","label":"...","unit":"...","higher_is_better":true,"poor":0,"good":0,"source_hint":"...","source_domain":"...","component":"optional, e.g. processor"}]}]}
+For an existing key, just repeat the key (add "component" if it measures a shared part); other fields are ignored.`,
       },
       { role: "user", content: `Criteria:\n${req.criteria.map((c) => `- ${c.name}: ${c.description}`).join("\n")}` },
     ],
@@ -160,6 +247,8 @@ For an existing key, just repeat the key; other fields are ignored.`,
           for (const m of entry.metrics) {
             if (!/^[a-z0-9_]{3,40}$/.test(String(m?.key))) return `metric key "${m?.key}" must be lowercase snake_case`;
             if (library[m.key]) continue;
+            if (specProxy({ key: String(m.key), label: String(m.label ?? ""), unit: String(m.unit ?? "") }))
+              return `"${m.key}" (${m.label}) is a specification, not a measured result: use a benchmark or lab test for "${c.name}", or no metric`;
             if (!Number.isFinite(Number(m.poor)) || !Number.isFinite(Number(m.good)) || Number(m.poor) === Number(m.good))
               return `metric "${m.key}" needs numeric "poor" and "good" values that differ`;
           }
@@ -186,7 +275,11 @@ For an existing key, just repeat the key; other fields are ignored.`,
           good: Number(m.good),
           sourceHint: String(m.source_hint || ""),
           sourceDomain: m.source_domain ? String(m.source_domain).replace(/^https?:\/\//, "").replace(/\/.*$/, "").toLowerCase() || undefined : undefined,
+          component: m.component ? String(m.component).trim().toLowerCase() || undefined : undefined,
         });
+      } else if (library[m.key] && !library[m.key].component && m.component) {
+        // An existing measurement turns out to measure a shared part: record that (its scale doesn't change).
+        setMetricComponent(req.category, m.key, String(m.component).trim().toLowerCase());
       }
       if (!keys.includes(m.key)) keys.push(m.key);
     }

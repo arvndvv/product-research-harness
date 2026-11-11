@@ -12,7 +12,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { config } from "./config.ts";
-import type { ProviderPreset, SearchOption, Settings, SettingsUpdate, SettingsView } from "./shared.ts";
+import { DEFAULT_PRICES, type ProviderPreset, type SearchOption, type Settings, type SettingsUpdate, type SettingsView } from "./shared.ts";
 
 /**
  * Presets offered in the UI, with setup help. All speak the OpenAI
@@ -232,6 +232,9 @@ export function settingsView(): SettingsView {
     main: s.main,
     judge: s.judge,
     search: { provider: s.search.provider, tavilyKeyHint: hint(s.search.tavilyKey), exaKeyHint: hint(s.search.exaKey), braveKeyHint: hint(s.search.braveKey), searxngUrl: s.search.searxngUrl },
+    prices: s.prices ?? {},
+    defaultPrices: DEFAULT_PRICES,
+    defaultRunBudgetUsd: s.defaultRunBudgetUsd ?? 1,
   };
 }
 
@@ -240,6 +243,12 @@ const nextKey = (current: string | undefined, update: string | null | undefined)
   update === null ? undefined : update === undefined || update === "" ? current : update.trim();
 
 export function validateUpdate(u: SettingsUpdate, s: Settings): string | null {
+  if (u.defaultRunBudgetUsd !== undefined && !(Number.isFinite(u.defaultRunBudgetUsd) && u.defaultRunBudgetUsd >= 0)) return "the run budget must be 0 (no limit) or more";
+  for (const [model, p] of Object.entries(u.prices ?? {})) {
+    if (!p) continue;
+    const ok = (n: unknown) => typeof n === "number" && Number.isFinite(n) && n >= 0;
+    if (!ok(p.input) || !ok(p.output) || (p.cachedInput !== undefined && !ok(p.cachedInput))) return `prices for ${model} must be numbers of 0 or more (USD per million tokens)`;
+  }
   if (u.search?.provider && !SEARCH_OPTIONS.some((o) => o.id === u.search!.provider)) return `unknown search service: ${u.search.provider}`;
   const providers = u.providers ?? s.providers;
   for (const p of providers) {
@@ -274,6 +283,12 @@ export function applyUpdate(u: SettingsUpdate): Settings {
   }
   if (u.main) s.main = { providerId: u.main.providerId, model: u.main.model.trim() };
   if (u.judge !== undefined) s.judge = u.judge ? { providerId: u.judge.providerId, model: u.judge.model.trim() } : undefined;
+  if (u.prices) {
+    const next: Record<string, { input: number; cachedInput?: number; output: number }> = {};
+    for (const [model, p] of Object.entries(u.prices)) if (p && model.trim()) next[model.trim()] = p;
+    s.prices = next;
+  }
+  if (u.defaultRunBudgetUsd !== undefined) s.defaultRunBudgetUsd = u.defaultRunBudgetUsd;
   if (u.search) {
     s.search = {
       provider: u.search.provider ?? s.search.provider,

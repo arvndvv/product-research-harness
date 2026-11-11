@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { ModelChoice, SearchOption, SearchProvider, SettingsView, SetupGuide } from "../../../src/shared.ts";
+import type { ModelChoice, ModelPrice, SearchOption, SearchProvider, SettingsView, SetupGuide } from "../../../src/shared.ts";
 import { api, type Preset } from "../api.ts";
 import { Button, Chip, cx } from "./ui.tsx";
 
@@ -56,6 +56,7 @@ export default function ModelSettings() {
 
       <Providers view={view} presets={presets} onSave={save} />
       <ModelChoices view={view} presets={presets} onSave={save} />
+      <CostSettings view={view} onSave={save} />
       <SearchSettings view={view} options={searchOptions} onSave={save} />
     </div>
   );
@@ -319,6 +320,104 @@ function ModelPicker({
       </div>
       {loadError && <p className="mt-1 text-xs text-red-600">Couldn't load the model list: {loadError}. You can still type a model name.</p>}
     </div>
+  );
+}
+
+// --- Cost -------------------------------------------------------------------------------
+
+/**
+ * Budget per run and model prices. Every model call is priced from this table
+ * and added to the run's cost; a run pauses when it reaches its budget.
+ */
+function CostSettings({ view, onSave }: { view: SettingsView; onSave: SaveFn }) {
+  const [budget, setBudget] = useState(String(view.defaultRunBudgetUsd));
+  const inUse = [view.main?.model, view.judge?.model].filter((m): m is string => !!m);
+  const models = [...new Set([...inUse, ...Object.keys(view.prices), ...Object.keys(view.defaultPrices)])];
+  const effective = (m: string): ModelPrice | undefined => view.prices[m] ?? view.defaultPrices[m];
+  const [rows, setRows] = useState<Record<string, { input: string; cachedInput: string; output: string }>>(() =>
+    Object.fromEntries(
+      models.map((m) => {
+        const p = effective(m);
+        return [m, { input: p ? String(p.input) : "", cachedInput: p?.cachedInput !== undefined ? String(p.cachedInput) : "", output: p ? String(p.output) : "" }];
+      }),
+    ),
+  );
+  const [newModel, setNewModel] = useState("");
+  const isLocal = (m: string) => view.providers.some((p) => /localhost|127\.0\.0\.1/.test(p.baseUrl) && (view.main?.model === m || view.judge?.model === m) && [view.main, view.judge].some((c) => c?.model === m && c.providerId === p.id));
+
+  async function save() {
+    const prices: Record<string, ModelPrice | null> = {};
+    for (const [m, r] of Object.entries(rows)) {
+      if (!r.input.trim() && !r.output.trim()) continue;
+      const p: ModelPrice = { input: Number(r.input), output: Number(r.output), ...(r.cachedInput.trim() ? { cachedInput: Number(r.cachedInput) } : {}) };
+      const d = view.defaultPrices[m];
+      // Only store what differs from the built-in price, so updated defaults still apply.
+      if (d && d.input === p.input && d.output === p.output && (d.cachedInput ?? undefined) === (p.cachedInput ?? undefined)) continue;
+      prices[m] = p;
+    }
+    await onSave({ prices, defaultRunBudgetUsd: Number(budget) }, "Cost settings saved. New prices apply to the next model call; the budget applies to new runs.");
+  }
+
+  const set = (m: string, k: "input" | "cachedInput" | "output", v: string) => setRows((r) => ({ ...r, [m]: { ...r[m], [k]: v } }));
+  const cell = "w-20 rounded-md border border-zinc-300 px-2 py-1 text-right font-mono text-xs outline-none focus:border-zinc-500";
+
+  return (
+    <section>
+      <h2 className="font-semibold">Cost</h2>
+      <p className="mt-1 text-sm text-zinc-500">
+        Every model call is priced and added to the run's cost, shown live on each run. A run pauses when it reaches its budget; you can raise it and resume.
+      </p>
+      <div className="mt-4 space-y-4 rounded-xl border border-zinc-200 bg-white p-4">
+        <Field label="Budget per run (USD)" hint="New runs pause at this cost. 0 = no limit. You can change it on each run.">
+          <input type="number" min="0" step="0.1" value={budget} onChange={(e) => setBudget(e.target.value)} className={cx(inputCls, "!w-32 font-mono")} />
+        </Field>
+        <div>
+          <div className="text-sm font-medium">Model prices (USD per 1 million tokens)</div>
+          <p className="text-xs text-zinc-500">Defaults are published list prices and may change; check your provider's pricing page or bill. Cached input is repeated prompt text billed at a discount.</p>
+          <table className="mt-2 w-full text-sm">
+            <thead>
+              <tr className="text-left text-xs text-zinc-500">
+                <th className="py-1 font-medium">Model</th>
+                <th className="py-1 text-right font-medium">Input</th>
+                <th className="py-1 text-right font-medium">Cached input</th>
+                <th className="py-1 text-right font-medium">Output</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Object.keys(rows).map((m) => (
+                <tr key={m} className="border-t border-zinc-100">
+                  <td className="py-1.5 font-mono text-xs">
+                    {m}
+                    {inUse.includes(m) && <span className="ml-2 rounded bg-zinc-100 px-1.5 py-0.5 font-sans text-[11px] text-zinc-600">in use</span>}
+                    {!rows[m].input && !isLocal(m) && <span className="ml-2 font-sans text-[11px] text-amber-700">no price: counted as $0</span>}
+                  </td>
+                  {(["input", "cachedInput", "output"] as const).map((k) => (
+                    <td key={k} className="py-1.5 text-right">
+                      <input type="number" min="0" step="0.01" value={rows[m][k]} onChange={(e) => set(m, k, e.target.value)} placeholder={k === "cachedInput" ? "same" : "?"} className={cell} />
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-2 flex gap-2">
+            <input value={newModel} onChange={(e) => setNewModel(e.target.value)} placeholder="Add a model name, e.g. llama-3.3-70b-versatile" className={cx(inputCls, "flex-1 font-mono text-xs")} />
+            <Button
+              variant="secondary"
+              disabled={!newModel.trim() || !!rows[newModel.trim()]}
+              onClick={() => {
+                setRows((r) => ({ ...r, [newModel.trim()]: { input: "", cachedInput: "", output: "" } }));
+                setNewModel("");
+              }}
+            >
+              Add
+            </Button>
+          </div>
+          <p className="mt-1 text-xs text-zinc-500">Local models (Ollama, LM Studio) are always free.</p>
+        </div>
+        <Button onClick={save}>Save cost settings</Button>
+      </div>
+    </section>
   );
 }
 

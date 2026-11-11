@@ -1,8 +1,22 @@
 # Domain pack: shoes
 
+Aliases: shoe, sneakers, trainers, running shoes
+
 Expert guidance used in every prompt when the category mentions shoes. Edit freely,
 because this file is how you teach the harness a domain. Copy it to make `laptops.md`,
 `headphones.md` and so on.
+
+## Decision factors
+
+- **Fit and width**: foot length and width, toe box room, true-to-size or not.
+- **Use**: running, walking all day, gym/court, trail, or a mix.
+- **Cushioning**: soft vs firm, stack height.
+- **Heel-to-toe drop**: what the person is used to.
+- **Stability**: neutral vs stability support.
+- **Grip**: surfaces (road, turf, wet floors).
+- **Weight**: matters for running.
+- **Durability**: outsole and upper wear for the person's mileage.
+- **Breathability**: hot and humid climates.
 
 ## What actually matters
 

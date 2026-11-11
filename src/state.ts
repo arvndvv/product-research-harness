@@ -6,6 +6,7 @@
  *  - a crash or Ctrl+C loses nothing: `npm start -- --resume runs/<id>`
  *  - you can open the files and see exactly what the agent knows
  */
+import { defaultRunBudget } from "./costs.ts";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
@@ -47,6 +48,7 @@ export function createRun(initialRequest: string): RunState {
     candidates: [],
     evidence: [],
     critiqueNotes: [],
+    budgetUsd: defaultRunBudget(),
   };
   saveState(state);
   return state;

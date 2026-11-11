@@ -14,3 +14,5 @@ import "./stop.test.ts";
 import "./metrics.test.ts";
 import "./settings.test.ts";
 import "./accuracy.test.ts";
+import "./costs.test.ts";
+import "./domains.test.ts";

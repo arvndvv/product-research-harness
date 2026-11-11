@@ -14,28 +14,100 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.ts";
-import type { ProfileFact } from "./shared.ts";
+import type { MetricDef, ProfileFact } from "./shared.ts";
 
 // --- Domain packs -------------------------------------------------------------
 
-function loadDomainPack(category: string): { name: string; text: string } | null {
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * The guide for a category. A guide matches by its file name (singular or
+ * plural) or an "Aliases:" line, as whole words. When several match, the one
+ * naming the product itself wins: "ssd for laptop" -> ssd, "laptop ram" -> ram
+ * (the part before "for/with/under", and the last product word in it).
+ */
+export function findDomainPack(category: string): { name: string; text: string } | null {
   const dir = config.paths.domains;
   if (!existsSync(dir)) return null;
-  const cat = category.toLowerCase();
+  const head = category.toLowerCase().split(/\b(?:for|with|under|below|within|around)\b/)[0];
+  let best: { name: string; text: string; at: number; len: number } | null = null;
   for (const file of readdirSync(dir)) {
     if (!file.endsWith(".md")) continue;
-    const base = file.slice(0, -3).toLowerCase();
-    const singular = base.replace(/s$/, "");
-    if (cat.includes(base) || cat.includes(singular)) {
-      return { name: file, text: readFileSync(join(dir, file), "utf8") };
+    const text = readFileSync(join(dir, file), "utf8");
+    const base = file.slice(0, -3).toLowerCase().replace(/[-_]+/g, " ");
+    const aliases = (text.match(/^aliases:\s*(.+)$/im)?.[1] ?? "").split(",").map((a) => a.trim().toLowerCase()).filter(Boolean);
+    for (const term of [base, base.replace(/(es|s)$/, ""), ...aliases]) {
+      if (term.length < 2) continue;
+      const m = new RegExp(`\\b${escapeRe(term)}(?:s|es)?\\b`).exec(head);
+      if (m && (!best || m.index > best.at || (m.index === best.at && term.length > best.len))) best = { name: file, text, at: m.index, len: term.length };
     }
   }
-  return null;
+  return best ? { name: best.name, text: best.text } : null;
+}
+const loadDomainPack = findDomainPack;
+
+/** One "## Heading" section of a guide (up to the next "## "), or "". */
+function section(text: string, heading: RegExp): string {
+  const parts = text.split(/^## /m);
+  const hit = parts.find((p) => heading.test(p.split("\n")[0]));
+  return hit ? hit.split("\n").slice(1).join("\n") : "";
 }
 
 export function domainBlock(category: string): string {
   const pack = loadDomainPack(category);
-  return pack ? `\nDomain guidance (from ${pack.name}, written by a human expert; follow it):\n${pack.text}\n` : "";
+  if (!pack) return "";
+  // The measurement table is for code (it seeds the measurement library), not for prompts.
+  const text = pack.text.replace(/^## Measurements[\s\S]*?(?=^## |(?![\s\S]))/m, "").trim();
+  return `\nDomain guidance (from ${pack.name}, written by a human expert; follow it):\n${text}\n`;
+}
+
+/**
+ * The guide's "## Decision factors" list: what the interview must account for
+ * (asked, known, or a visible assumption). Bullet text before ":" or " - ".
+ */
+export function domainFactors(category: string): string[] {
+  const pack = loadDomainPack(category);
+  if (!pack) return [];
+  return section(pack.text, /^decision factors/i)
+    .split("\n")
+    .map((l) => l.match(/^\s*[-*]\s+(.+)$/)?.[1] ?? "")
+    .map((l) => l.replace(/\*\*/g, "").split(/:| [-–—] /)[0].trim())
+    .filter((l) => l.length >= 2)
+    .slice(0, 14);
+}
+
+/**
+ * The guide's "## Measurements" table: trusted measurements with fixed scales
+ * for the category. They seed the measurement library, so every run in the
+ * category uses the same benchmarks and scales from the start.
+ *
+ * | key | label | unit | better | poor | good | source | part |
+ */
+export function domainMetrics(category: string): MetricDef[] {
+  const pack = loadDomainPack(category);
+  if (!pack) return [];
+  const defs: MetricDef[] = [];
+  for (const line of section(pack.text, /^measurements/i).split("\n")) {
+    const cells = line.split("|").map((c) => c.trim());
+    if (cells.length < 8) continue;
+    const [, key, label, unit, better, poor, good, source, part] = cells;
+    if (!/^[a-z0-9_]{3,40}$/.test(key)) continue; // header and separator rows
+    const p = Number(poor);
+    const g = Number(good);
+    if (!Number.isFinite(p) || !Number.isFinite(g) || p === g) continue;
+    defs.push({
+      key,
+      label,
+      unit,
+      higherIsBetter: !/^lower/i.test(better),
+      poor: p,
+      good: g,
+      sourceHint: source.replace(/`/g, ""),
+      sourceDomain: source.match(/[a-z0-9-]+\.[a-z.]{2,}/i)?.[0]?.toLowerCase(),
+      component: part && part !== "-" ? part.toLowerCase() : undefined,
+    });
+  }
+  return defs;
 }
 
 // --- User profile ---------------------------------------------------------------

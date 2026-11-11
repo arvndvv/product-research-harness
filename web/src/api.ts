@@ -19,10 +19,14 @@ export const api = {
   runs: () => request<RunSummary[]>("/api/runs"),
   run: (id: string) => request<RunDetail>(`/api/runs/${encodeURIComponent(id)}`),
   startRun: (text: string) => request<RunSummary>("/api/runs", { method: "POST", body: JSON.stringify({ request: text }) }),
-  addCandidate: (id: string, name: string, note: string) =>
-    request<{ name: string; started: boolean }>(`/api/runs/${encodeURIComponent(id)}/candidates`, { method: "POST", body: JSON.stringify({ name, note }) }),
+  addCandidate: (id: string, name: string, note: string, links: string[] = []) =>
+    request<{ name: string; started: boolean }>(`/api/runs/${encodeURIComponent(id)}/candidates`, { method: "POST", body: JSON.stringify({ name, note, links }) }),
   addRemark: (id: string, name: string, text: string, links: string[]) =>
     request<{ name: string; started: boolean }>(`/api/runs/${encodeURIComponent(id)}/remarks`, { method: "POST", body: JSON.stringify({ name, text, links }) }),
+  setBudget: (id: string, usd: number) =>
+    request<{ budgetUsd: number }>(`/api/runs/${encodeURIComponent(id)}/budget`, { method: "PUT", body: JSON.stringify({ usd }) }),
+  restart: (id: string, step: "discover" | "shortlist") =>
+    request<{ message: string }>(`/api/runs/${encodeURIComponent(id)}/restart`, { method: "POST", body: JSON.stringify({ step }) }),
   stop: (id: string) => request<{ ok: true }>(`/api/runs/${encodeURIComponent(id)}/stop`, { method: "POST" }),
   editBrief: (id: string, edit: BriefEdit) =>
     request<{ changes: string[]; next: "report" | "score" | "none" }>(`/api/runs/${encodeURIComponent(id)}/brief`, { method: "PUT", body: JSON.stringify(edit) }),
